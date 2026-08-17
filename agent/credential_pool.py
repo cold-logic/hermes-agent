@@ -774,7 +774,12 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        clear_status_ids: Optional[List[str]] = None,
+    ) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -782,6 +787,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                clear_status_ids=clear_status_ids,
             )
 
     def _is_terminal_auth_failure(
@@ -2331,6 +2337,7 @@ class CredentialPool:
     def reset_statuses(self) -> int:
         with self._lock:
             count = 0
+            cleared_ids: List[str] = []
             new_entries = []
             for entry in self._entries:
                 if entry.last_status or entry.last_status_at or entry.last_error_code:
@@ -2345,12 +2352,19 @@ class CredentialPool:
                             last_error_reset_at=None,
                         )
                     )
+                    cleared_ids.append(entry.id)
                     count += 1
                 else:
                     new_entries.append(entry)
             if count:
                 self._entries = new_entries
-                self._persist()
+                # The operator's explicit reset must be authoritative over a
+                # still-binding on-disk cooldown: skip the stale-snapshot
+                # cooldown merge for exactly the entries we cleared, otherwise
+                # _merge_disk_cooldown_state resurrects the exhausted marker
+                # (newer last_status_at, unexpired) and `auth reset` becomes a
+                # no-op for active cooldowns.
+                self._persist(clear_status_ids=cleared_ids)
             return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:

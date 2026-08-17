@@ -288,3 +288,38 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_reset_statuses_clears_cooldown_against_newer_disk_state(classic_env):
+    """Operator `auth reset` must be authoritative over a still-binding cooldown.
+
+    Regression: reset_statuses() cleared the status in memory, but _persist()
+    -> write_credential_pool() re-merged the on-disk exhausted marker (newer
+    last_status_at, unexpired) back onto the entry — `hermes auth reset` was a
+    no-op for active cooldowns. The explicit reset must skip the stale-snapshot
+    merge for exactly the entries it cleared.
+    """
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    _write(classic_env / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(
+            access_token="sk-x",
+            last_status="exhausted",
+            last_status_at=time.time() - 30,  # newer AND unexpired (1h cooldown)
+            last_error_code=429,
+        )],
+    }))
+
+    disk_data = json.loads((classic_env / "auth.json").read_text())
+    disk_entry = disk_data["credential_pool"]["openrouter"][0]
+    pool = CredentialPool(
+        "openrouter",
+        [PooledCredential.from_dict("openrouter", disk_entry)],
+    )
+    assert pool.reset_statuses() == 1
+
+    data = json.loads((classic_env / "auth.json").read_text())
+    persisted = data["credential_pool"]["openrouter"][0]
+    assert persisted.get("last_status") is None
+    assert persisted.get("last_error_code") is None
+    assert persisted.get("last_status_at") is None
