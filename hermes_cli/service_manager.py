@@ -671,6 +671,7 @@ class S6ServiceManager:
             "# shellcheck shell=sh",
             "set -e",
             "export HOME=/opt/data",
+            "export HERMES_HOME_MODE=0710",
             "cd /opt/data",
             ". /opt/hermes/.venv/bin/activate",
         ]
