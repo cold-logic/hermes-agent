@@ -104,7 +104,7 @@ def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
-    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree")):
+    for prefix, kind in (("dir:", "dir"), ("worktree:", "worktree"), ("jj:", "jj")):
         if not v.startswith(prefix):
             continue
         path = v[len(prefix):].strip()
@@ -115,7 +115,7 @@ def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
         return (kind, os.path.expanduser(path))
     raise argparse.ArgumentTypeError(
         f"unknown --workspace value {value!r}: use scratch, worktree, "
-        "worktree:<path>, or dir:<path>"
+        "worktree:<path>, dir:<path>, or jj:<path>"
     )
 
 
@@ -1014,6 +1014,68 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    # --- jj-integrate ---
+    p_jji = sub.add_parser(
+        "jj-integrate",
+        help="Manually trigger jj integration for a completed task",
+        description=(
+            "Re-runs the squash→rebase→conflict-check→bookmark-advance→push pipeline "
+            "for a specific task. Useful for tasks completed before auto-integration "
+            "was added, or after manually resolving a conflict bookmark."
+        ),
+    )
+    p_jji.add_argument("task_id", help="Task ID to integrate (e.g. t_abc123)")
+    p_jji.add_argument(
+        "--force", action="store_true",
+        help="Allow integration of tasks not yet in done/archived state",
+    )
+
+    # --- jj-test ---
+    p_jjt = sub.add_parser(
+        "jj-test",
+        help="End-to-end smoke test for the jj workspace pipeline",
+        description=(
+            "Creates a throwaway task, dispatches it with a trivial instruction, "
+            "waits for completion, verifies the integration bookmark advanced and "
+            "the diff stat is non-empty, then cleans up. Reports PASS/FAIL."
+        ),
+    )
+    p_jjt.add_argument(
+        "--repo", required=True,
+        help="Path to the jj main repo to test against (e.g. /opt/data/workspace/big-idea-rn)",
+    )
+    p_jjt.add_argument(
+        "--assignee", default="big-idea-w1",
+        help="Worker profile to dispatch the test task to (default: big-idea-w1)",
+    )
+    p_jjt.add_argument(
+        "--timeout", type=int, default=300,
+        help="Seconds to wait for task completion before giving up (default: 300)",
+    )
+    p_jjt.add_argument(
+        "--no-cleanup", action="store_true",
+        help="Leave the test task and commits in place after the test",
+    )
+
+    # --- jj-status ---
+    p_jj = sub.add_parser(
+        "jj-status",
+        help="Show jj integration status across all active jj-workspace tasks",
+        description=(
+            "Queries all tasks with workspace_kind=jj and shows their integration "
+            "state: running workspaces, integration/conflict bookmarks, ahead/behind "
+            "counts, and diff stats for completed tasks."
+        ),
+    )
+    p_jj.add_argument(
+        "--repo", default=None,
+        help="Limit to tasks whose workspace_path matches this repo path",
+    )
+    p_jj.add_argument(
+        "--json", action="store_true", dest="json",
+        help="Emit JSON",
+    )
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1151,6 +1213,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "jj-status":     _cmd_jj_status,
+            "jj-integrate":  _cmd_jj_integrate,
+            "jj-test":       _cmd_jj_test,
         }
         handler = handlers.get(action)
         if not handler:
@@ -1755,6 +1820,85 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
+    # For completed jj tasks, show the diff --stat of the integrated commit
+    # so you can see what changed without leaving kanban show.
+    if task.workspace_kind == "jj" and task.workspace_path and task.status == "done":
+        try:
+            import subprocess as _sp
+            from pathlib import Path as _Path
+            # Prefer the image-baked, mise-managed jj on PATH (kept current by
+            # the Dockerfile's pinned version) over any ad hoc `cargo install`
+            # binaries an agent subprocess may have left under the per-profile
+            # subprocess HOME ({HERMES_HOME}/home — see AGENTS.md "HOME vs
+            # HERMES_HOME" section) or /root. Those can silently drift stale.
+            _JJ_CANDIDATES = [
+                "/usr/local/bin/jj",
+                "/opt/data/home/.cargo/bin/jj",
+                "/root/.cargo/bin/jj",
+            ]
+            _jj_bin = "jj"
+            for _c in _JJ_CANDIDATES:
+                if _Path(_c).exists():
+                    _jj_bin = _c
+                    break
+            _main_repo = _Path(task.workspace_path)
+            # Look for the commit on the integration or conflicts bookmark
+            # that matches this task id.
+            for _rev in (f"conflicts/{task.id}", "integration"):
+                _desc_r = _sp.run(
+                    [_jj_bin, "--no-pager", "log", "--no-graph",
+                     "-r", _rev,
+                     "-T", f"description ++ '\\n'"],
+                    cwd=str(_main_repo),
+                    capture_output=True, text=True, timeout=5,
+                )
+                if _desc_r.returncode == 0 and task.id in _desc_r.stdout:
+                    _stat_r = _sp.run(
+                        [_jj_bin, "--no-pager", "diff", "--stat", "-r", _rev],
+                        cwd=str(_main_repo),
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if _stat_r.returncode == 0 and _stat_r.stdout.strip():
+                        _bm_label = "conflicts" if _rev.startswith("conflicts/") else "integration"
+                        print(f"  diff-stat: [{_bm_label}]")
+                        for _line in _stat_r.stdout.strip().splitlines():
+                            print(f"    {_line}")
+                    break
+        except Exception:
+            pass  # best-effort — never block show output
+    # For jj tasks, show recent op log entries that mention this workspace
+    # so you have a precise audit trail of what the automation did.
+    if task.workspace_kind == "jj" and task.workspace_path:
+        try:
+            import subprocess as _sp2
+            from pathlib import Path as _Path2
+            # See jj-version-resolution note above: prefer the image-baked PATH jj.
+            _JJ2 = ["/usr/local/bin/jj", "/opt/data/home/.cargo/bin/jj", "/root/.cargo/bin/jj"]
+            _jj2 = next((_c for _c in _JJ2 if _Path2(_c).exists()), "jj")
+            _main2 = _Path2(task.workspace_path)
+            # Walk up if workspace_path is the jj workspace dir, not the main repo
+            if not (_main2 / ".jj" / "repo").is_dir():
+                _ws_name2 = _main2.name
+                _main2 = _main2.parent / _main2.name.replace(f"-jj-{task.id}", "")
+            else:
+                _ws_name2 = f"{_main2.name}-jj-{task.id}"
+            if _main2.is_dir() and (_main2 / ".jj" / "repo").is_dir():
+                _op_r = _sp2.run(
+                    [_jj2, "--no-pager", "op", "log", "--no-graph",
+                     "-T", 'id.short(8) ++ " " ++ description.first_line() ++ "\n"'],
+                    cwd=str(_main2), capture_output=True, text=True, timeout=10,
+                )
+                if _op_r.returncode == 0:
+                    _relevant = [
+                        ln for ln in _op_r.stdout.splitlines()
+                        if _ws_name2 in ln or task.id in ln
+                    ][:5]
+                    if _relevant:
+                        print(f"  jj-ops:")
+                        for _ln in _relevant:
+                            print(f"    {_ln}")
+        except Exception:
+            pass
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
@@ -3351,6 +3495,794 @@ Common subcommands:
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
+  `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `assign <id> <profile>`  Reassign
+  `boards list`         Show all boards
+  `assignees`           Known profiles + counts
+  `context <id>`        Full worker-context dump
+  `runs <id>`           Attempt history
+  `log <id>`            Worker log
+
+Run `/kanban <subcommand> -h` for arguments. \
+Read-only commands are safe while an agent is running.\
+"""
+
+
+def run_slash(rest: str) -> str:
+    """Execute a ``/kanban …`` string and return captured stdout/stderr.
+
+    ``rest`` is everything after ``/kanban`` (may be empty).  Used from
+    both the interactive CLI (``self._handle_kanban_command``) and the
+    gateway (``_handle_kanban_command``) so formatting is identical.
+    """
+    import io
+    import contextlib
+
+    tokens = shlex.split(rest) if rest and rest.strip() else []
+
+    # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
+    # show the curated short-help block instead of dumping argparse's full
+    # usage tree (which is enormous and reads as garbage in a chat
+    # bubble).  Per-subcommand help still works via ``/kanban foo -h``.
+    if not tokens or tokens[0] in {"help", "--help", "-h", "?"}:
+        return _SLASH_KANBAN_HELP
+
+    # Single argparse tree rooted at "/kanban".  build_parser() expects a
+    # subparsers action to attach to, so build a throwaway one and pull
+    # the kanban_parser back out — then drive it directly so usage/error
+    # text reads as ``/kanban`` (not ``/kanban-wrap kanban``).
+    _wrap = argparse.ArgumentParser(prog="/kanban-wrap", add_help=False)
+    _wrap.exit_on_error = False  # type: ignore[attr-defined]
+    _top_sub = _wrap.add_subparsers(dest="_top")
+    kanban_parser = build_parser(_top_sub)
+    kanban_parser.prog = "/kanban"
+    kanban_parser.exit_on_error = False  # type: ignore[attr-defined]
+    for _action in kanban_parser._actions:
+        if isinstance(_action, argparse._SubParsersAction):
+            for _name, _choice in _action.choices.items():
+                _choice.prog = f"/kanban {_name}"
+                _choice.exit_on_error = False  # type: ignore[attr-defined]
+
+    def _usage_for_error() -> str:
+        if tokens:
+            for _action in kanban_parser._actions:
+                if isinstance(_action, argparse._SubParsersAction):
+                    subparser = _action.choices.get(tokens[0])
+                    if subparser is not None:
+                        return subparser.format_usage().rstrip()
+        return kanban_parser.format_usage().rstrip()
+
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    # ``-h`` / ``--help`` makes argparse print to stdout and SystemExit(0).
+    # Capture both streams so neither the help text nor the error text
+    # bypasses our buffer.
+    try:
+        with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+            args = kanban_parser.parse_args(tokens)
+    except SystemExit as exc:
+        out = buf_out.getvalue().rstrip()
+        err = buf_err.getvalue().rstrip()
+        # Help dump (exit 0) → return the captured help text directly.
+        if exc.code in {0, None} and out:
+            return out
+        body = err or out
+        return f"⚠ /kanban usage error\n{body}" if body else "⚠ /kanban usage error"
+    except argparse.ArgumentError as exc:
+        return f"⚠ /kanban usage error\n{_usage_for_error()}\n{exc}"
+
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        try:
+            kanban_command(args)
+        except SystemExit:
+            pass
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+
+    out = buf_out.getvalue().rstrip()
+    err = buf_err.getvalue().rstrip()
+    if err and out:
+        return f"{out}\n{err}"
+    return err if err else (out or "(no output)")
+
+
+def _cmd_jj_test(args: argparse.Namespace) -> int:
+    """End-to-end smoke test for the jj workspace pipeline.
+
+    Creates a throwaway task, dispatches it with a trivial one-line edit,
+    waits for completion, verifies the integration bookmark advanced and
+    the diff stat is non-empty, then optionally archives the test task.
+    Exits 0 on PASS, 1 on FAIL.
+    """
+    import subprocess as _sp
+    import time as _time
+    from pathlib import Path as _Path
+
+    repo = _Path(getattr(args, "repo")).expanduser().resolve()
+    assignee: str = getattr(args, "assignee", "big-idea-w1")
+    timeout_secs: int = getattr(args, "timeout", 300)
+    no_cleanup: bool = getattr(args, "no_cleanup", False)
+
+    # Prefer the image-baked, mise-managed jj on PATH; see the jj-version-resolution
+    # note in _cmd_kanban_show — same rationale applies to every jj call site here.
+    _JJ_CANDIDATES = ["/usr/local/bin/jj", "/opt/data/home/.cargo/bin/jj", "/root/.cargo/bin/jj"]
+    _jj = next((_c for _c in _JJ_CANDIDATES if _Path(_c).exists()), "jj")
+
+    def _fail(msg: str) -> int:
+        print(f"\nFAIL: {msg}", file=sys.stderr)
+        return 1
+
+    def _pass(msg: str) -> int:
+        print(f"\nPASS: {msg}")
+        return 0
+
+    # --- Pre-flight checks ---
+    if not repo.is_dir() or not (repo / ".jj" / "repo").is_dir():
+        return _fail(f"not a jj repo: {repo}")
+
+    _bm_r = _sp.run(
+        [_jj, "--no-pager", "bookmark", "list", "-T", "name ++ '\\n'"],
+        cwd=str(repo), capture_output=True, text=True, timeout=10,
+    )
+    existing_bms = set(_bm_r.stdout.strip().splitlines())
+    integration_before = None
+    if "integration" in existing_bms:
+        _int_r = _sp.run(
+            [_jj, "--no-pager", "log", "--no-graph", "-r", "integration",
+             "-T", "change_id ++ '\\n'"],
+            cwd=str(repo), capture_output=True, text=True, timeout=10,
+        )
+        integration_before = _int_r.stdout.strip().splitlines()[0].strip() if _int_r.returncode == 0 else None
+
+    print(f"jj-test: repo={repo}")
+    print(f"jj-test: assignee={assignee}, timeout={timeout_secs}s")
+    if integration_before:
+        print(f"jj-test: integration bookmark before = {integration_before[:8]}")
+
+    # --- Create test task ---
+    test_title = f"jj-test smoke test {int(_time.time())}"
+    test_body = (
+        "SMOKE TEST — this is an automated pipeline verification task.\n\n"
+        "Add a single comment line to any existing source file in this repo. "
+        "The comment should read: `# jj-test: pipeline verification`. "
+        "Make exactly one file change. Do not create new files."
+    )
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title=test_title,
+            body=test_body,
+            assignee=assignee,
+            created_by="jj-test",
+            workspace_kind="jj",
+            workspace_path=str(repo),
+        )
+    print(f"jj-test: created task {task_id}")
+
+    # --- Dispatch ---
+    with kb.connect_closing() as conn:
+        kb.promote_task(conn, task_id)
+    print(f"jj-test: promoted to ready, waiting for dispatch...")
+
+    # --- Poll for completion ---
+    deadline = _time.time() + timeout_secs
+    last_status = None
+    while _time.time() < deadline:
+        _time.sleep(10)
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, task_id)
+        if task is None:
+            return _fail("task disappeared from database")
+        if task.status != last_status:
+            print(f"jj-test: status = {task.status}")
+            last_status = task.status
+        if task.status == "done":
+            break
+        if task.status in ("blocked", "archived"):
+            return _fail(f"task ended in {task.status!r} — check logs with: hermes kanban show {task_id}")
+    else:
+        return _fail(f"timed out after {timeout_secs}s — task is {task.status!r}")
+
+    print(f"jj-test: task completed")
+
+    # --- Verify integration bookmark advanced ---
+    _int_r2 = _sp.run(
+        [_jj, "--no-pager", "log", "--no-graph", "-r", "integration",
+         "-T", "change_id ++ '\\n'"],
+        cwd=str(repo), capture_output=True, text=True, timeout=10,
+    )
+    integration_after = _int_r2.stdout.strip().splitlines()[0].strip() if _int_r2.returncode == 0 else None
+
+    if not integration_after:
+        return _fail("integration bookmark does not exist after task completion")
+    if integration_after == integration_before:
+        # May have landed on a conflict bookmark instead
+        conflict_bm = f"conflicts/{task_id}"
+        _sp.run(
+            [_jj, "--no-pager", "bookmark", "list", "-T", "name ++ '\\n'"],
+            cwd=str(repo), capture_output=True, text=True, timeout=10,
+        )
+        if conflict_bm in existing_bms:
+            return _fail(f"rebase produced a conflict — see bookmark {conflict_bm}")
+        return _fail("integration bookmark did not advance after task completion")
+
+    print(f"jj-test: integration bookmark advanced {(integration_before or 'none')[:8]} → {integration_after[:8]}")
+
+    # --- Verify diff stat is non-empty ---
+    _stat_r = _sp.run(
+        [_jj, "--no-pager", "diff", "--stat", "-r", "integration"],
+        cwd=str(repo), capture_output=True, text=True, timeout=10,
+    )
+    if _stat_r.returncode != 0 or not _stat_r.stdout.strip():
+        return _fail("diff --stat on integration is empty — agent made no changes")
+
+    print(f"jj-test: diff stat:")
+    for line in _stat_r.stdout.strip().splitlines():
+        print(f"  {line}")
+
+    # --- Cleanup ---
+    if not no_cleanup:
+        with kb.connect_closing() as conn:
+            kb.archive_task(conn, task_id)
+        print(f"jj-test: archived task {task_id}")
+
+    return _pass(f"pipeline verified end-to-end ({task_id})")
+
+
+def _cmd_context(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        text = kb.build_worker_context(conn, args.task_id)
+    print(text)
+    return 0
+
+
+def _cmd_jj_integrate(args: argparse.Namespace) -> int:
+    """Manually trigger jj integration for a completed task.
+
+    Useful for tasks that completed before auto-integration was added, or
+    for re-integrating a task after resolving a conflict bookmark manually.
+    """
+    import subprocess as _sp
+    from pathlib import Path as _Path
+
+    task_id: str = args.task_id
+    force: bool = getattr(args, "force", False)
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        if task is None:
+            print(f"no such task: {task_id}", file=sys.stderr)
+            return 1
+        if task.workspace_kind != "jj":
+            print(f"task {task_id} has workspace_kind={task.workspace_kind!r}, not 'jj'", file=sys.stderr)
+            return 1
+        if task.status not in ("done", "archived") and not force:
+            print(
+                f"task {task_id} is {task.status!r} — only done/archived tasks can be "
+                f"re-integrated (use --force to override)",
+                file=sys.stderr,
+            )
+            return 1
+        if not task.workspace_path:
+            print(f"task {task_id} has no workspace_path", file=sys.stderr)
+            return 1
+
+    # Prefer the image-baked, mise-managed jj on PATH; see the jj-version-resolution
+    # note in _cmd_kanban_show.
+    _JJ_CANDIDATES = ["/usr/local/bin/jj", "/opt/data/home/.cargo/bin/jj", "/root/.cargo/bin/jj"]
+    _jj_bin = "jj"
+    for _c in _JJ_CANDIDATES:
+        if _Path(_c).exists():
+            _jj_bin = _c
+            break
+
+    main_repo = _Path(task.workspace_path)
+    ws_name = f"{main_repo.name}-jj-{task_id}"
+
+    if not main_repo.is_dir() or not (main_repo / ".jj" / "repo").is_dir():
+        print(f"jj repo not found at {main_repo}", file=sys.stderr)
+        return 1
+
+    # Get the change ID for this task's workspace @.
+    # First try the live workspace (if it still exists), then fall back to
+    # searching the commit graph by task description.
+    agent_change_id = ""
+    _rev_result = _sp.run(
+        [_jj_bin, "--no-pager", "log", "--no-graph",
+         "-r", f"{ws_name}@",
+         "-T", "change_id ++ '\\n'"],
+        cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+    )
+    if _rev_result.returncode == 0 and _rev_result.stdout.strip():
+        agent_change_id = _rev_result.stdout.strip().splitlines()[0].strip()
+    else:
+        # Workspace is gone — find commit by task id in description.
+        _desc_r = _sp.run(
+            [_jj_bin, "--no-pager", "log", "--no-graph",
+             "-r", f"description(glob:\"*({task_id}*\")",
+             "-T", "change_id ++ '\\n'"],
+            cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+        )
+        if _desc_r.returncode == 0 and _desc_r.stdout.strip():
+            agent_change_id = _desc_r.stdout.strip().splitlines()[0].strip()
+
+    if not agent_change_id:
+        print(
+            f"could not find commit for task {task_id} — workspace may be cleaned up "
+            f"and commit not found in graph by description",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Found commit: {agent_change_id[:8]} for task {task_id}")
+
+    # Check empty.
+    _empty_r = _sp.run(
+        [_jj_bin, "--no-pager", "log", "--no-graph",
+         "-r", f"empty() & {agent_change_id}", "-T", "'empty'"],
+        cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+    )
+    if _empty_r.stdout.strip():
+        print("Commit is empty — nothing to integrate.")
+        return 0
+
+    # Find base bookmark.
+    _bm_r = _sp.run(
+        [_jj_bin, "--no-pager", "bookmark", "list", "--all-remotes",
+         "-T", "name ++ '\\n'"],
+        cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+    )
+    existing_bm = set(_bm_r.stdout.strip().splitlines())
+
+    # Drop stale conflict bookmark if present, to allow re-integration.
+    conflict_bm = f"conflicts/{task_id}"
+    if conflict_bm in existing_bm:
+        _del_r = _sp.run(
+            [_jj_bin, "bookmark", "delete", conflict_bm],
+            cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+        )
+        if _del_r.returncode == 0:
+            print(f"Removed stale conflict bookmark: {conflict_bm}")
+            existing_bm.discard(conflict_bm)
+
+    if "integration" in existing_bm:
+        base_rev = "integration"
+    elif "main" in existing_bm:
+        base_rev = "main"
+    elif "master" in existing_bm:
+        base_rev = "master"
+    else:
+        base_rev = "root()"
+
+    print(f"Rebasing {agent_change_id[:8]} onto {base_rev} ...")
+    _rebase_r = _sp.run(
+        [_jj_bin, "rebase", "-r", agent_change_id, "-d", base_rev],
+        cwd=str(main_repo), capture_output=True, text=True, timeout=60,
+    )
+    if _rebase_r.returncode != 0:
+        print(f"Rebase failed:\n{_rebase_r.stderr.strip()}", file=sys.stderr)
+        return 1
+
+    # Check for conflicts.
+    _conf_r = _sp.run(
+        [_jj_bin, "--no-pager", "log", "--no-graph",
+         "-r", agent_change_id, "-T", "conflict ++ '\\n'"],
+        cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+    )
+    has_conflict = _conf_r.stdout.strip() == "true"
+
+    if has_conflict:
+        _sp.run(
+            [_jj_bin, "bookmark", "set", conflict_bm, "-r", agent_change_id],
+            cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+        )
+        print(
+            f"Rebase produced conflicts.\n"
+            f"Parked on bookmark: {conflict_bm}\n"
+            f"Resolve with: jj resolve -r {conflict_bm} -R {main_repo}\n"
+            f"Then re-run: hermes kanban jj-integrate {task_id} --force"
+        )
+        return 1
+
+    # Clean — advance integration.
+    _sp.run(
+        [_jj_bin, "bookmark", "set", "integration", "-r", agent_change_id],
+        cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+    )
+    print(f"Integrated: {agent_change_id[:8]} → integration bookmark")
+
+    # Diff stat.
+    _stat_r = _sp.run(
+        [_jj_bin, "--no-pager", "diff", "--stat", "-r", agent_change_id],
+        cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+    )
+    if _stat_r.returncode == 0 and _stat_r.stdout.strip():
+        print(_stat_r.stdout.strip())
+
+    print(f"\nTo push: jj git push --bookmark integration -R {main_repo}")
+    return 0
+
+
+def _cmd_jj_status(args: argparse.Namespace) -> int:
+    """Show jj integration status across all active/recent jj-workspace tasks."""
+    import subprocess as _sp
+    from pathlib import Path as _Path
+
+    # Prefer the image-baked, mise-managed jj on PATH; see the jj-version-resolution
+    # note in _cmd_kanban_show.
+    _JJ_CANDIDATES = [
+        "/usr/local/bin/jj",
+        "/opt/data/home/.cargo/bin/jj",
+        "/root/.cargo/bin/jj",
+    ]
+    _jj_bin = "jj"
+    for _c in _JJ_CANDIDATES:
+        if _Path(_c).exists():
+            _jj_bin = _c
+            break
+
+    repo_filter = getattr(args, "repo", None)
+    as_json = getattr(args, "json", False)
+
+    with kb.connect_closing() as conn:
+        # Fetch all jj tasks that are active or recently completed.
+        rows = conn.execute(
+            """
+            SELECT id, title, status, workspace_path, assignee
+              FROM tasks
+             WHERE workspace_kind = 'jj'
+               AND status NOT IN ('archived')
+             ORDER BY created_at DESC
+             LIMIT 100
+            """
+        ).fetchall()
+
+    if repo_filter:
+        rows = [r for r in rows if r["workspace_path"] and repo_filter in r["workspace_path"]]
+
+    if not rows:
+        print("(no jj-workspace tasks found)")
+        return 0
+
+    # Group by main repo path.
+    from collections import defaultdict
+    by_repo: dict[str, list] = defaultdict(list)
+    for row in rows:
+        wp = row["workspace_path"] or ""
+        by_repo[wp].append(row)
+
+    results = []
+
+    for repo_path, task_rows in by_repo.items():
+        main_repo = _Path(repo_path) if repo_path else None
+        repo_info: dict = {"repo": repo_path, "tasks": []}
+
+        # Get repo-level info once per repo.
+        bookmarks: list[str] = []
+        conflict_bookmarks: list[str] = []
+        ahead_count = 0
+        trunk = None
+        if main_repo and main_repo.is_dir() and (main_repo / ".jj" / "repo").is_dir():
+            _bm_r = _sp.run(
+                [_jj_bin, "--no-pager", "bookmark", "list",
+                 "-T", "name ++ '\\n'"],
+                cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+            )
+            if _bm_r.returncode == 0:
+                bookmarks = [b for b in _bm_r.stdout.strip().splitlines() if b]
+                conflict_bookmarks = [b for b in bookmarks if b.startswith("conflicts/")]
+                trunk = next((b for b in ("main", "master") if b in bookmarks), None)
+
+            if trunk and "integration" in bookmarks:
+                _ah_r = _sp.run(
+                    [_jj_bin, "--no-pager", "log", "--no-graph",
+                     "-r", f"{trunk} ~ ancestors(integration)",
+                     "-T", "'x\\n'"],
+                    cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+                )
+                ahead_count = len(_ah_r.stdout.strip().splitlines()) if _ah_r.returncode == 0 else 0
+
+            repo_info["trunk"] = trunk
+            repo_info["integration_exists"] = "integration" in bookmarks
+            repo_info["trunk_ahead_of_integration"] = ahead_count
+            repo_info["conflict_bookmarks"] = conflict_bookmarks
+
+        for row in task_rows:
+            task_info: dict = {
+                "id": row["id"],
+                "title": row["title"],
+                "status": row["status"],
+                "assignee": row["assignee"],
+                "workspace": None,
+                "integrated": False,
+                "conflicted": False,
+                "diff_stat": None,
+            }
+            ws_name = f"{main_repo.name}-jj-{row['id']}" if main_repo else None
+            ws_path = main_repo.parent / ws_name if main_repo and ws_name else None
+            if ws_path:
+                task_info["workspace"] = str(ws_path)
+                task_info["workspace_exists"] = ws_path.is_dir()
+
+            # Check integration state from bookmarks.
+            conflict_bm = f"conflicts/{row['id']}"
+            if conflict_bm in bookmarks:
+                task_info["conflicted"] = True
+                task_info["conflict_bookmark"] = conflict_bm
+            if "integration" in bookmarks and main_repo and main_repo.is_dir():
+                _int_r = _sp.run(
+                    [_jj_bin, "--no-pager", "log", "--no-graph",
+                     "-r", "integration",
+                     "-T", "description ++ '\\n'"],
+                    cwd=str(main_repo), capture_output=True, text=True, timeout=5,
+                )
+                if _int_r.returncode == 0 and row["id"] in _int_r.stdout:
+                    task_info["integrated"] = True
+                    # Get diff stat for integrated commit.
+                    _ds_r = _sp.run(
+                        [_jj_bin, "--no-pager", "diff", "--stat", "-r", "integration"],
+                        cwd=str(main_repo), capture_output=True, text=True, timeout=10,
+                    )
+                    if _ds_r.returncode == 0:
+                        task_info["diff_stat"] = _ds_r.stdout.strip()
+
+            repo_info["tasks"].append(task_info)
+        results.append(repo_info)
+
+    if as_json:
+        print(json.dumps(results, indent=2, ensure_ascii=False))
+        return 0
+
+    # Human-readable output.
+    for repo_info in results:
+        rp = repo_info.get("repo") or "(unknown repo)"
+        trunk = repo_info.get("trunk")
+        ahead = repo_info.get("trunk_ahead_of_integration", 0)
+        int_exists = repo_info.get("integration_exists", False)
+        conflicts = repo_info.get("conflict_bookmarks", [])
+
+        print(f"\nRepo: {rp}")
+        if trunk:
+            status_str = f"integration {'exists' if int_exists else 'not yet created'}"
+            if ahead:
+                status_str += f", {trunk} is {ahead} commit(s) ahead"
+            print(f"  {status_str}")
+        if conflicts:
+            print(f"  Conflict bookmarks: {', '.join(conflicts)}")
+
+        for t in repo_info.get("tasks", []):
+            state = []
+            if t.get("integrated"):
+                state.append("integrated")
+            if t.get("conflicted"):
+                state.append(f"conflict → {t.get('conflict_bookmark', '')}")
+            if not state:
+                ws_exists = t.get("workspace_exists")
+                if ws_exists:
+                    state.append("workspace active")
+                elif t["status"] == "done":
+                    state.append("done (not integrated)")
+                else:
+                    state.append(t["status"])
+
+            state_str = ", ".join(state)
+            print(f"  {t['id']}  [{state_str}]  {t['title'][:60]}  @{t['assignee'] or '-'}")
+            if t.get("diff_stat"):
+                for line in t["diff_stat"].splitlines():
+                    print(f"    {line}")
+
+    return 0
+
+
+def _cmd_specify(args: argparse.Namespace) -> int:
+    """Flesh out a triage task (or all of them) via auxiliary LLM,
+    then promote to todo. Thin wrapper over ``kanban_specify``."""
+    from hermes_cli import kanban_specify as spec
+
+    all_flag = bool(getattr(args, "all_triage", False))
+    tenant = getattr(args, "tenant", None)
+    author = getattr(args, "author", None) or _profile_author()
+    want_json = bool(getattr(args, "json", False))
+
+    if args.task_id and all_flag:
+        print(
+            "kanban: pass either a task id OR --all, not both",
+            file=sys.stderr,
+        )
+        return 2
+
+    if all_flag:
+        ids = spec.list_triage_ids(tenant=tenant)
+        if not ids:
+            msg = (
+                "No triage tasks"
+                + (f" for tenant {tenant!r}" if tenant else "")
+                + "."
+            )
+            if want_json:
+                print(json.dumps({"specified": 0, "total": 0}))
+            else:
+                print(msg)
+            return 0
+    elif args.task_id:
+        ids = [args.task_id]
+    else:
+        print(
+            "kanban: specify requires a task id or --all",
+            file=sys.stderr,
+        )
+        return 2
+
+    ok_count = 0
+    fail_count = 0
+    for tid in ids:
+        outcome = spec.specify_task(tid, author=author)
+        if outcome.ok:
+            ok_count += 1
+        else:
+            fail_count += 1
+        if want_json:
+            print(json.dumps({
+                "task_id": outcome.task_id,
+                "ok": outcome.ok,
+                "reason": outcome.reason,
+                "new_title": outcome.new_title,
+            }))
+        elif outcome.ok:
+            title_suffix = (
+                f" — retitled: {outcome.new_title!r}"
+                if outcome.new_title
+                else ""
+            )
+            print(f"Specified {outcome.task_id} → todo{title_suffix}")
+        else:
+            print(
+                f"kanban: specify {outcome.task_id}: {outcome.reason}",
+                file=sys.stderr,
+            )
+    if not all_flag:
+        return 0 if ok_count == 1 else 1
+    # --all: succeed if at least one promotion landed; exit 1 only when
+    # every candidate failed (honest signal for scripts).
+    return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_decompose(args: argparse.Namespace) -> int:
+    """Fan a triage task (or all of them) out into a graph of child
+    tasks via the auxiliary LLM, routed to specialist profiles by
+    description. Thin wrapper over ``kanban_decompose``."""
+    from hermes_cli import kanban_decompose as decomp
+
+    all_flag = bool(getattr(args, "all_triage", False))
+    tenant = getattr(args, "tenant", None)
+    author = getattr(args, "author", None) or _profile_author()
+    want_json = bool(getattr(args, "json", False))
+
+    if args.task_id and all_flag:
+        print(
+            "kanban: pass either a task id OR --all, not both",
+            file=sys.stderr,
+        )
+        return 2
+
+    if all_flag:
+        ids = decomp.list_triage_ids(tenant=tenant)
+        if not ids:
+            msg = (
+                "No triage tasks"
+                + (f" for tenant {tenant!r}" if tenant else "")
+                + "."
+            )
+            if want_json:
+                print(json.dumps({"decomposed": 0, "total": 0}))
+            else:
+                print(msg)
+            return 0
+    elif args.task_id:
+        ids = [args.task_id]
+    else:
+        print(
+            "kanban: decompose requires a task id or --all",
+            file=sys.stderr,
+        )
+        return 2
+
+    ok_count = 0
+    for tid in ids:
+        outcome = decomp.decompose_task(tid, author=author)
+        if outcome.ok:
+            ok_count += 1
+        if want_json:
+            print(json.dumps({
+                "task_id": outcome.task_id,
+                "ok": outcome.ok,
+                "reason": outcome.reason,
+                "fanout": outcome.fanout,
+                "child_ids": outcome.child_ids,
+                "new_title": outcome.new_title,
+            }))
+        elif outcome.ok:
+            if outcome.fanout and outcome.child_ids:
+                child_summary = ", ".join(outcome.child_ids)
+                print(
+                    f"Decomposed {outcome.task_id} → {len(outcome.child_ids)} "
+                    f"children ({child_summary}); root promoted to todo"
+                )
+            else:
+                title_suffix = (
+                    f" — retitled: {outcome.new_title!r}"
+                    if outcome.new_title
+                    else ""
+                )
+                print(
+                    f"Specified {outcome.task_id} → todo "
+                    f"(no fanout){title_suffix}"
+                )
+        else:
+            print(
+                f"kanban: decompose {outcome.task_id}: {outcome.reason}",
+                file=sys.stderr,
+            )
+    if not all_flag:
+        return 0 if ok_count == 1 else 1
+    return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_gc(args: argparse.Namespace) -> int:
+    """Remove scratch workspaces of archived tasks, prune old events, and
+    delete old worker logs."""
+    import shutil
+    scratch_root = kb.workspaces_root()
+    removed_ws = 0
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
+        ).fetchall()
+    for row in rows:
+        if row["workspace_kind"] != "scratch":
+            continue
+        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+        try:
+            path = path.resolve()
+        except OSError:
+            continue
+        try:
+            path.relative_to(scratch_root.resolve())
+        except ValueError:
+            # Safety: never delete outside the scratch root.
+            continue
+        if path.exists() and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed_ws += 1
+
+    event_days = getattr(args, "event_retention_days", 30)
+    log_days = getattr(args, "log_retention_days", 30)
+    with kb.connect_closing() as conn:
+        removed_events = kb.gc_events(
+            conn, older_than_seconds=event_days * 24 * 3600,
+        )
+    removed_logs = kb.gc_worker_logs(
+        older_than_seconds=log_days * 24 * 3600,
+    )
+    print(f"GC complete: {removed_ws} workspace(s), "
+          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Slash-command entry point (used by /kanban from CLI and gateway)
+# ---------------------------------------------------------------------------
+
+_SLASH_KANBAN_HELP = """\
+**/kanban** — manage the shared task board.
+
+Common subcommands:
+  `list` (alias `ls`)   List tasks on the current board
+  `show <id>`           Task details + comments + events
+  `stats`               Per-status / per-assignee counts
+  `create <title>…`     Create a task (auto-subscribes you to events)
+  `comment <id> <msg>`  Append a comment
+  `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards

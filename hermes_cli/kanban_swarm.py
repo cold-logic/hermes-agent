@@ -137,7 +137,7 @@ def create_swarm(
     synthesizer_title: str = "Synthesize swarm outputs",
     tenant: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
-    workspace_kind: str = "scratch",
+    workspace_kind: str = "scratch",  # also supports "worktree", "dir", "jj"  # also supports "worktree", "dir", "jj"
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
@@ -208,7 +208,7 @@ def _create_swarm_uncommitted(
     synthesizer_title: str = "Synthesize swarm outputs",
     tenant: Optional[str] = None,
     created_by: str = "swarm-orchestrator",
-    workspace_kind: str = "scratch",
+    workspace_kind: str = "scratch",  # also supports "worktree", "dir", "jj"  # also supports "worktree", "dir", "jj"
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,

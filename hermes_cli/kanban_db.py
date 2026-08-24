@@ -132,7 +132,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
-VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir", "jj"}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -5875,6 +5875,79 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
+def _jj_notify(
+    conn: sqlite3.Connection,
+    task_id: str,
+    change_id: str,
+    *,
+    outcome: str,
+    bookmark: str,
+    main_repo: "Path",
+    jj_bin: str,
+) -> None:
+    """Register a Telegram/Discord kanban notification for a jj integration event.
+
+    Reads TELEGRAM_HOME_CHANNEL (and optionally DISCORD_HOME_CHANNEL) from the
+    environment and calls add_notify_sub so the gateway kanban-notifier delivers
+    a completion message.  The notifier fires on the 'completed' task event that
+    complete_task() already emitted, so no extra event is needed here.
+
+    Also appends a short jj diff --stat to the task result field so the
+    notification body includes file-change context.
+    """
+    try:
+        import os as _os
+        import subprocess as _sp
+
+        # Append diff --stat to task result so the notifier body has context.
+        _stat_r = _sp.run(
+            [jj_bin, "--no-pager", "diff", "--stat", "-r", change_id],
+            cwd=str(main_repo),
+            capture_output=True, text=True, timeout=10,
+        )
+        stat_text = _stat_r.stdout.strip() if _stat_r.returncode == 0 else ""
+
+        outcome_label = "integrated" if outcome == "integrated" else f"conflict → {bookmark}"
+        note = f"[jj {outcome_label}] {change_id[:8]}"
+        if stat_text:
+            note += f"\n{stat_text}"
+
+        # Append to the task result so it surfaces in notifications.
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET result = COALESCE(result || '\n\n', '') || ? WHERE id = ?",
+                (note, task_id),
+            )
+
+        # Register notification subscriptions for configured home channels.
+        _tg_chat = _os.environ.get("TELEGRAM_HOME_CHANNEL", "").strip()
+        _tg_thread = _os.environ.get("TELEGRAM_HOME_CHANNEL_THREAD_ID", "").strip() or None
+        _profile = _os.environ.get("HERMES_PROFILE", "default")
+
+        if _tg_chat:
+            add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id=_tg_chat,
+                thread_id=_tg_thread,
+                notifier_profile=_profile,
+            )
+
+        _dc_chat = _os.environ.get("DISCORD_HOME_CHANNEL", "").strip()
+        if _dc_chat:
+            add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="discord",
+                chat_id=_dc_chat,
+                notifier_profile=_profile,
+            )
+
+    except Exception:
+        pass  # notifications are best-effort — never block cleanup
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -5893,6 +5966,186 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if kind == "jj":
+            if path:
+                wp = Path(path)
+                main_repo = wp.parent / wp.name.replace(f"-jj-{task_id}", "")
+                if main_repo.is_dir() and (main_repo / ".jj" / "repo").is_dir():
+                    import subprocess
+                    import logging as _logging
+                    _jj_log = _logging.getLogger(__name__)
+
+                    # Resolve jj binary. Prefer the image-baked, mise-managed jj
+                    # on PATH (/usr/local/bin/jj, kept current by the Dockerfile's
+                    # pinned version) over any ad hoc `cargo install` binary an
+                    # agent subprocess may have left under the per-profile
+                    # subprocess HOME ({HERMES_HOME}/home — see AGENTS.md "HOME
+                    # vs HERMES_HOME" section) or /root. Those can drift stale
+                    # silently since nothing upgrades them on image rebuild.
+                    _JJ_CANDIDATES = [
+                        "/usr/local/bin/jj",
+                        "/opt/data/home/.cargo/bin/jj",
+                        "/root/.cargo/bin/jj",
+                    ]
+                    _jj_bin = "jj"
+                    for _candidate in _JJ_CANDIDATES:
+                        if Path(_candidate).exists():
+                            _jj_bin = _candidate
+                            break
+
+                    # Determine the workspace name jj uses (basename of ws path)
+                    ws_name = wp.name
+
+                    # --- Auto-integrate: rebase agent's commit onto integration bookmark ---
+                    # Get the change ID of this workspace's @ (the agent's tip commit).
+                    _rev_result = subprocess.run(
+                        [_jj_bin, "--no-pager", "log", "--no-graph",
+                         "-r", f"{ws_name}@",
+                         "-T", "change_id ++ '\\n'"],
+                        cwd=str(main_repo),
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    agent_change_id = _rev_result.stdout.strip().splitlines()[0].strip() if _rev_result.returncode == 0 else ""
+
+                    if agent_change_id:
+                        # Check if there's a non-empty commit to integrate
+                        _empty_result = subprocess.run(
+                            [_jj_bin, "--no-pager", "log", "--no-graph",
+                             "-r", f"empty() & {agent_change_id}",
+                             "-T", "'empty'"],
+                            cwd=str(main_repo),
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        is_empty = bool(_empty_result.stdout.strip())
+
+                        if not is_empty:
+                            # --- Commit hygiene: squash intermediate commits ---
+                            # Collapse all commits in the workspace that aren't
+                            # already the single agent tip into one clean commit,
+                            # so integration log stays one-commit-per-task.
+                            _ancestors_result = subprocess.run(
+                                [_jj_bin, "--no-pager", "log", "--no-graph",
+                                 "-r", f"{agent_change_id}:: ~ {agent_change_id}",
+                                 "-T", "change_id ++ '\\n'"],
+                                cwd=str(main_repo),
+                                capture_output=True, text=True, timeout=10,
+                            )
+                            # Only squash if there are intermediate commits below the tip
+                            _intermediates = [
+                                l.strip() for l in _ancestors_result.stdout.strip().splitlines()
+                                if l.strip() and l.strip() != agent_change_id
+                            ]
+                            if _intermediates:
+                                subprocess.run(
+                                    [_jj_bin, "squash",
+                                     "--from", f"ancestors({agent_change_id}, 2)+",
+                                     "--into", agent_change_id],
+                                    cwd=str(main_repo),
+                                    capture_output=True, text=True, timeout=30,
+                                )
+                                _jj_log.info(
+                                    "jj cleanup: squashed %d intermediate commit(s) into %s",
+                                    len(_intermediates), agent_change_id[:8],
+                                )
+
+                            # Find the integration bookmark, or fall back to main/master.
+                            _bm_result = subprocess.run(
+                                [_jj_bin, "--no-pager", "bookmark", "list",
+                                 "--all-remotes", "-T", "name ++ '\\n'"],
+                                cwd=str(main_repo),
+                                capture_output=True, text=True, timeout=10,
+                            )
+                            existing_bookmarks = set(_bm_result.stdout.strip().splitlines())
+                            if "integration" in existing_bookmarks:
+                                base_rev = "integration"
+                            elif "main" in existing_bookmarks:
+                                base_rev = "main"
+                            elif "master" in existing_bookmarks:
+                                base_rev = "master"
+                            else:
+                                base_rev = "root()"
+
+                            # Rebase the agent's commit onto the integration base.
+                            _rebase_result = subprocess.run(
+                                [_jj_bin, "rebase",
+                                 "-r", agent_change_id,
+                                 "-d", base_rev],
+                                cwd=str(main_repo),
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            if _rebase_result.returncode == 0:
+                                # Check whether the rebase introduced conflicts.
+                                _conflict_result = subprocess.run(
+                                    [_jj_bin, "--no-pager", "log", "--no-graph",
+                                     "-r", agent_change_id,
+                                     "-T", "conflict ++ '\\n'"],
+                                    cwd=str(main_repo),
+                                    capture_output=True, text=True, timeout=10,
+                                )
+                                has_conflict = _conflict_result.stdout.strip() == "true"
+
+                                if has_conflict:
+                                    # Park on a per-task conflict bookmark instead of
+                                    # advancing integration — keeps integration clean.
+                                    conflict_bookmark = f"conflicts/{task_id}"
+                                    subprocess.run(
+                                        [_jj_bin, "bookmark", "set", conflict_bookmark,
+                                         "-r", agent_change_id],
+                                        cwd=str(main_repo),
+                                        capture_output=True, text=True, timeout=10,
+                                    )
+                                    _jj_log.warning(
+                                        "jj cleanup: rebase of %s onto %s produced conflicts "
+                                        "— parked on bookmark %s, integration bookmark unchanged",
+                                        agent_change_id[:8], base_rev, conflict_bookmark,
+                                    )
+                                    # Notify: conflict
+                                    _jj_notify(conn, task_id, agent_change_id,
+                                               outcome="conflict",
+                                               bookmark=conflict_bookmark,
+                                               main_repo=main_repo,
+                                               jj_bin=_jj_bin)
+                                else:
+                                    # Clean rebase — advance (or create) the integration bookmark.
+                                    subprocess.run(
+                                        [_jj_bin, "bookmark", "set", "integration",
+                                         "-r", agent_change_id],
+                                        cwd=str(main_repo),
+                                        capture_output=True, text=True, timeout=10,
+                                    )
+                                    _jj_log.info(
+                                        "jj cleanup: integrated %s onto %s → integration bookmark",
+                                        agent_change_id[:8], base_rev,
+                                    )
+                                    # Notify: integrated
+                                    _jj_notify(conn, task_id, agent_change_id,
+                                               outcome="integrated",
+                                               bookmark="integration",
+                                               main_repo=main_repo,
+                                               jj_bin=_jj_bin)
+                            else:
+                                _jj_log.warning(
+                                    "jj cleanup: rebase of %s onto %s failed: %s",
+                                    agent_change_id[:8], base_rev,
+                                    _rebase_result.stderr.strip(),
+                                )
+                        else:
+                            _jj_log.info(
+                                "jj cleanup: skipping integration for %s — commit is empty",
+                                agent_change_id[:8],
+                            )
+
+                    # Forget the workspace (detaches @ so the repo is clean)
+                    subprocess.run(
+                        [_jj_bin, "workspace", "forget", ws_name],
+                        cwd=str(main_repo),
+                        capture_output=True, timeout=10,
+                    )
+                if wp.is_dir():
+                    import shutil
+                    shutil.rmtree(wp, ignore_errors=True)
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -7888,6 +8141,139 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
         return p
+    if kind == "jj":
+        import subprocess
+        import logging as _rw_log
+        _log_rw = _rw_log.getLogger(__name__)
+
+        if not task.workspace_path:
+            raise ValueError(
+                f"task {task.id} has workspace_kind=jj but no workspace_path"
+            )
+        main_repo = Path(task.workspace_path).expanduser()
+        if not main_repo.is_absolute():
+            raise ValueError(
+                f"task {task.id} has non-absolute jj repo path "
+                f"{task.workspace_path!r}; use an absolute path"
+            )
+        if not (main_repo / ".jj" / "repo").is_dir():
+            raise ValueError(
+                f"task {task.id}: jj repo not found at {main_repo}"
+            )
+
+        # Resolve jj binary. Prefer the image-baked, mise-managed jj on PATH;
+        # see the longer note in _cleanup_workspace above.
+        _JJ_CANDIDATES = [
+            "/usr/local/bin/jj",
+            "/opt/data/home/.cargo/bin/jj",
+            "/root/.cargo/bin/jj",
+        ]
+        _jj_bin = "jj"
+        for _candidate in _JJ_CANDIDATES:
+            if Path(_candidate).exists():
+                _jj_bin = _candidate
+                break
+
+        # --- Auto-advance integration base ---
+        # If main/master has moved ahead of integration, rebase the integration
+        # stack onto main before creating the workspace so agents always start
+        # from a fresh base. Threshold: auto-advance at ≥1 commit ahead;
+        # warn (but don't block) if the rebase itself fails.
+        try:
+            _bm_result = subprocess.run(
+                [_jj_bin, "--no-pager", "bookmark", "list", "--all-remotes",
+                 "-T", "name ++ '\\n'"],
+                cwd=str(main_repo),
+                capture_output=True, text=True, timeout=10,
+            )
+            _existing_bm = set(_bm_result.stdout.strip().splitlines())
+            _trunk = next(
+                (b for b in ("main", "master") if b in _existing_bm), None
+            )
+            if _trunk and "integration" in _existing_bm:
+                # Count commits trunk has that integration stack doesn't
+                _ahead_result = subprocess.run(
+                    [_jj_bin, "--no-pager", "log", "--no-graph",
+                     "-r", f"{_trunk} ~ ancestors(integration)",
+                     "-T", "'x\\n'"],
+                    cwd=str(main_repo),
+                    capture_output=True, text=True, timeout=10,
+                )
+                _ahead_count = (
+                    len(_ahead_result.stdout.strip().splitlines())
+                    if _ahead_result.returncode == 0 else 0
+                )
+                if _ahead_count > 0:
+                    _log_rw.info(
+                        "jj workspace: %s is %d commit(s) ahead of integration — "
+                        "auto-rebasing integration stack onto %s before dispatch (task %s)",
+                        _trunk, _ahead_count, _trunk, task.id,
+                    )
+                    # Rebase the entire integration stack (excluding trunk) onto trunk.
+                    _adv_result = subprocess.run(
+                        [_jj_bin, "rebase",
+                         "-s", f"roots(integration:: ~ {_trunk}::)",
+                         "-d", _trunk],
+                        cwd=str(main_repo),
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    if _adv_result.returncode == 0:
+                        # Re-point integration bookmark to the new head of the stack.
+                        _head_result = subprocess.run(
+                            [_jj_bin, "--no-pager", "log", "--no-graph",
+                             "-r", "heads(integration::)",
+                             "-T", "change_id ++ '\\n'"],
+                            cwd=str(main_repo),
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        _new_head = _head_result.stdout.strip().splitlines()[0].strip() if _head_result.returncode == 0 else ""
+                        if _new_head:
+                            subprocess.run(
+                                [_jj_bin, "bookmark", "set", "integration",
+                                 "-r", _new_head],
+                                cwd=str(main_repo),
+                                capture_output=True, text=True, timeout=10,
+                            )
+                        _log_rw.info(
+                            "jj workspace: integration stack rebased onto %s (task %s)",
+                            _trunk, task.id,
+                        )
+                    else:
+                        _log_rw.warning(
+                            "jj workspace: auto-rebase of integration onto %s failed: %s "
+                            "— proceeding with stale base (task %s)",
+                            _trunk, _adv_result.stderr.strip()[:200], task.id,
+                        )
+        except Exception:
+            pass  # auto-advance is best-effort — never block dispatch
+
+        ws_name = f"{main_repo.name}-jj-{task.id}"
+        ws_path = main_repo.parent / ws_name
+        if not ws_path.is_dir():
+            result = subprocess.run(
+                [_jj_bin, "workspace", "add", str(ws_path)],
+                cwd=str(main_repo),
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                raise ValueError(
+                    f"task {task.id}: jj workspace add failed: "
+                    f"{result.stderr.strip()}"
+                )
+
+        # --- Commit message from task title ---
+        # Set the workspace's @ description to the task title so the
+        # integration log reads as a changelog once all agents land.
+        commit_msg = f"{task.title} ({task.id})"
+        subprocess.run(
+            [_jj_bin, "--no-pager", "describe",
+             "-r", f"{ws_name}@",
+             "-m", commit_msg],
+            cwd=str(main_repo),
+            capture_output=True, text=True, timeout=10,
+        )
+
+        return ws_path
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 

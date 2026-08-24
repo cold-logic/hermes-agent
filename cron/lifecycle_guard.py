@@ -293,7 +293,13 @@ _BINARY_MAGIC_PREFIXES = (
 )
 _BINARY_SNIFF_BYTES = 4096
 
-
+# Data files can legitimately contain gateway-action strings (ledgers,
+# handoffs, logs) but cannot be executed as shell scripts, so scanning them
+# as command text is pure false-positive surface.
+_DATA_EXTENSIONS = frozenset({
+    ".jsonl", ".json", ".md", ".log", ".txt", ".csv",
+    ".yaml", ".yml", ".toml", ".lock", ".out", ".err",
+})
 
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
@@ -671,6 +677,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         resolved = path
     if _is_cloud_placeholder_path(resolved):
         return None, True
+    # Data files are not scripts; do not scan their content as command
+    # text (they may legitimately contain gateway-action strings).
+    if resolved.suffix.lower() in _DATA_EXTENSIONS:
+        return None, False
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
