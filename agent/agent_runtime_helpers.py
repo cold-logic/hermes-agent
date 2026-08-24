@@ -99,7 +99,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "setup_mcp", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "drive_preview", "annotate_preview", "read_window_below", "setup_mcp", "tour", "delegate_task"}
 )
 
 
@@ -707,6 +707,9 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
     # ``_get_tool_call_id_static``'s ``call_id || id`` — a match set must
     # accept every legitimate reference, not just the canonical one (#58168).
     known_tool_ids: set = set()
+    # Maps every registered id variant back to the full variant set of the
+    # tool_call it came from, so consuming one variant consumes its siblings.
+    tool_id_siblings: Dict[str, set] = {}
     filtered: List[Dict] = []
     for msg in collapsed:
         if not isinstance(msg, dict):
@@ -715,13 +718,24 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         role = msg.get("role")
         if role == "assistant":
             known_tool_ids = set()
+            tool_id_siblings = {}
             for tc in (msg.get("tool_calls") or []):
-                if not isinstance(tc, dict):
-                    continue
+                # Mirror ``_get_tool_call_id_static``'s dict-or-object
+                # tolerance: SDK tool_call objects (e.g. an unserialized
+                # ``ChatCompletionMessageToolCall``) reach this pass on
+                # host-fed / pre-serialization histories just as often as
+                # plain dicts. Skipping non-dict entries left
+                # ``known_tool_ids`` empty for such messages, so the
+                # following legitimate ``tool`` result was misclassified
+                # as orphaned and silently dropped.
+                variants = set()
                 for key in ("id", "call_id"):
-                    tc_id = tc.get(key)
+                    tc_id = tc.get(key) if isinstance(tc, dict) else getattr(tc, key, None)
                     if tc_id:
-                        known_tool_ids.add(tc_id)
+                        variants.add(tc_id)
+                for tc_id in variants:
+                    known_tool_ids.add(tc_id)
+                    tool_id_siblings[tc_id] = variants
             filtered.append(msg)
         elif role == "tool":
             tc_id = msg.get("tool_call_id")
@@ -732,7 +746,16 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # glitch) falls into the drop branch below instead of being
                 # replayed — strict providers (DeepSeek) reject a duplicate
                 # tool_call_id with HTTP 400 (#58327). Credit: #55436.
-                known_tool_ids.discard(tc_id)
+                #
+                # Consume EVERY variant of the matched call, not just the one
+                # this result referenced. A Codex/Responses tool_call registers
+                # both ``id`` (``fc_...``) and ``call_id`` (``call_...``) above
+                # (#58168), so discarding only the matched key leaves its
+                # sibling live — and a duplicate result keyed on that sibling
+                # sails straight through this guard, re-creating the very 400
+                # the consume step exists to prevent.
+                for sibling in tool_id_siblings.get(tc_id, {tc_id}):
+                    known_tool_ids.discard(sibling)
             else:
                 repairs += 1
         else:
@@ -1349,6 +1372,7 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
@@ -1579,6 +1603,7 @@ def restore_primary_runtime(agent) -> bool:
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
@@ -2574,6 +2599,18 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             client_kwargs["default_headers"] = existing
     except Exception:
         _ra().logger.debug("Copilot default-header guard skipped", exc_info=True)
+
+    # OpenCode Free: the tier is served ANONYMOUSLY — any bearer the relay
+    # doesn't recognize (including placeholders) is a 401. Route every
+    # opencode-free client through the shared keyless header policy: an
+    # empty Authorization default_header overrides the SDK's
+    # "Bearer <api_key>" so no credential ever reaches the wire.
+    if agent.provider == "opencode-free":
+        from hermes_cli.models import opencode_zen_free_headers
+
+        _existing = dict(client_kwargs.get("default_headers") or {})
+        _existing.update(opencode_zen_free_headers())
+        client_kwargs["default_headers"] = _existing
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)
@@ -2614,9 +2651,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # hit /v1/v1/messages.  `model_switch.switch_model()` already strips
     # this, but we guard here so any direct callers (future code paths,
     # tests) can't reintroduce the double-/v1 404 bug.
+    from hermes_cli.models import opencode_provider_family
+
     if (
         api_mode == "anthropic_messages"
-        and new_provider in {"opencode-zen", "opencode-go"}
+        and opencode_provider_family(new_provider) is not None
         and isinstance(base_url, str)
         and base_url
     ):
@@ -2652,6 +2691,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_anthropic_base_url",
             "_is_anthropic_oauth",
             "_config_context_length",
+            "_reasoning_echo_flag",
         )
     }
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
@@ -2685,6 +2725,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         agent.model = new_model
         agent.provider = new_provider
         agent.requested_provider = new_provider
+        # Re-read reasoning_echo from config so the flag reflects the new
+        # primary model's setting (see _reasoning_echo_opt_in).
+        agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
         # Use the new base_url when provided. When it's empty AND the
         # provider is actually changing, do NOT fall back to the current
         # (old provider's) URL — that silently pairs the new provider label
@@ -2970,6 +3013,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,
+        "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),
         "compressor_model": getattr(_cc, "model", agent.model) if _cc else agent.model,
         "compressor_base_url": getattr(_cc, "base_url", agent.base_url) if _cc else agent.base_url,
         "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
@@ -3200,6 +3244,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
+                    questions=next_args.get("questions"),
                     callback=agent.clarify_callback,
                 ),
                 next_args,
@@ -3226,12 +3271,60 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 ),
                 next_args,
             )
+    elif function_name == "drive_preview":
+        def _execute(next_args: dict) -> Any:
+            from tools.drive_preview_tool import drive_preview_tool as _drive_preview_tool
+            return _finish_agent_tool(
+                _drive_preview_tool(
+                    action=next_args.get("action", ""),
+                    ref=next_args.get("ref"),
+                    selector=next_args.get("selector"),
+                    text=next_args.get("text"),
+                    key=next_args.get("key"),
+                    submit=next_args.get("submit"),
+                    amount=next_args.get("amount"),
+                    to=next_args.get("to"),
+                    limit=next_args.get("max"),
+                    callback=getattr(agent, "drive_preview_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "annotate_preview":
+        def _execute(next_args: dict) -> Any:
+            from tools.annotate_preview_tool import annotate_preview_tool as _annotate_preview_tool
+            return _finish_agent_tool(
+                _annotate_preview_tool(
+                    action=next_args.get("action", "add"),
+                    ref=next_args.get("ref"),
+                    selector=next_args.get("selector"),
+                    label=next_args.get("label"),
+                    callback=getattr(agent, "drive_preview_callback", None),
+                ),
+                next_args,
+            )
     elif function_name == "read_window_below":
         def _execute(next_args: dict) -> Any:
             from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
             return _finish_agent_tool(
                 _read_window_below_tool(
                     callback=getattr(agent, "read_window_below_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "tour":
+        def _execute(next_args: dict) -> Any:
+            from tools.tour_tool import tour_tool as _tour_tool
+            return _finish_agent_tool(
+                _tour_tool(
+                    action=next_args.get("action", ""),
+                    surface=next_args.get("surface"),
+                    selector=next_args.get("selector"),
+                    title=next_args.get("title"),
+                    text=next_args.get("text"),
+                    side=next_args.get("side"),
+                    steps=next_args.get("steps"),
+                    step_index=next_args.get("step_index"),
+                    callback=getattr(agent, "tour_callback", None),
                 ),
                 next_args,
             )
@@ -3385,6 +3478,25 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
 
     return None
 
+
+def _tool_call_id_variants(tc: Any) -> set:
+    """Return every id a tool result might legitimately match this tool_call on.
+
+    A tool_call can carry both ``call_id`` and ``id`` with different values
+    (Responses-API / codex flows), and different code paths key the matching
+    ``role="tool"`` result's ``tool_call_id`` off one or the other. Returning
+    all non-empty variants lets the sanitizer treat a result matching ANY of
+    them as paired, so a valid result is never falsely orphaned and dropped.
+    """
+    variants: set = set()
+    if isinstance(tc, dict):
+        candidates = (tc.get("call_id"), tc.get("id"))
+    else:
+        candidates = (getattr(tc, "call_id", None), getattr(tc, "id", None))
+    for c in candidates:
+        if isinstance(c, str) and c.strip():
+            variants.add(c.strip())
+    return variants
 
 
 # Placeholder substituted for an empty non-final message that would otherwise
@@ -3626,8 +3738,18 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     for msg in messages:
         if msg.get("role") == "assistant":
             for tc in msg.get("tool_calls") or []:
-                cid = _ra().AIAgent._get_tool_call_id_static(tc)
-                if cid:
+                # A tool_call may carry BOTH ``call_id`` and ``id`` with
+                # DIFFERENT values (e.g. Responses-API / codex tool calls,
+                # where ``id`` is a ``fc_...`` response-item id distinct from
+                # the ``call_...`` id). ``_get_tool_call_id_static`` returns
+                # only the preferred one (``call_id``), but a tool result
+                # keyed on the OTHER id would then look orphaned and get
+                # dropped + replaced with a bogus "[Result unavailable]"
+                # stub — silently eating a perfectly valid tool result
+                # (#55626). Register EVERY id variant so a result matching
+                # any of them survives. This is purely additive: it can only
+                # prevent false drops, never introduce new ones.
+                for cid in _tool_call_id_variants(tc):
                     surviving_call_ids.add(cid)
 
     result_call_ids: set = set()
@@ -3649,26 +3771,37 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             len(orphaned_results),
         )
 
-    # 2. Inject stub results for calls whose result was dropped
-    missing_results = surviving_call_ids - result_call_ids
-    if missing_results:
-        patched: List[Dict[str, Any]] = []
-        for msg in messages:
-            patched.append(msg)
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    cid = _ra().AIAgent._get_tool_call_id_static(tc)
-                    if cid in missing_results:
-                        patched.append({
-                            "role": "tool",
-                            "name": _ra().AIAgent._get_tool_call_name_static(tc),
-                            "content": "[Result unavailable — see context summary above]",
-                            "tool_call_id": cid,
-                        })
+    # 2. Inject stub results for calls whose result was dropped.
+    #    A call is "answered" when ANY of its id variants (call_id/id) has a
+    #    matching result, so a call answered via its ``id`` (fc_...) is not
+    #    mistaken for unanswered just because its distinct ``call_id`` has no
+    #    result of its own (#55626).
+    stub_count = 0
+    patched: List[Dict[str, Any]] = []
+    for msg in messages:
+        patched.append(msg)
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                variants = _tool_call_id_variants(tc)
+                if not variants:
+                    continue
+                if variants & result_call_ids:
+                    continue  # already answered on some id variant
+                cid = _ra().AIAgent._get_tool_call_id_static(tc)
+                if not cid:
+                    continue
+                patched.append({
+                    "role": "tool",
+                    "name": _ra().AIAgent._get_tool_call_name_static(tc),
+                    "content": "[Result unavailable — see context summary above]",
+                    "tool_call_id": cid,
+                })
+                stub_count += 1
+    if stub_count:
         messages = patched
         _ra().logger.debug(
             "Pre-call sanitizer: added %d stub tool result(s)",
-            len(missing_results),
+            stub_count,
         )
 
     # 3. Deduplicate tool_call_ids. Strict providers (DeepSeek) reject a
@@ -3693,6 +3826,14 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     # that reuses the id re-arms that id first.
     seen_assistant_call_ids: set = set()
     outstanding_call_ids: set = set()
+    # Variant → full variant-set of the tool_call it belongs to, so answering
+    # or deduping one variant consumes its siblings too. A Codex/Responses
+    # tool_call registers BOTH ``id`` (fc_...) and ``call_id`` (call_...)
+    # (#55626/#58168); tracking only the coalesced id here made a result
+    # keyed on the OTHER variant look like it answered no outstanding call,
+    # so this pass deleted the very result step 2's variant-aware matching
+    # had just preserved (issue #93251 — whole parallel batches vanished).
+    dedup_id_siblings: Dict[str, set] = {}
     deduped: List[Dict[str, Any]] = []
     removed_dupes = 0
     for msg in messages:
@@ -3700,13 +3841,14 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if role == "assistant" and msg.get("tool_calls"):
             kept_tcs = []
             for tc in msg.get("tool_calls") or []:
-                cid = _ra().AIAgent._get_tool_call_id_static(tc)
-                if cid and cid in seen_assistant_call_ids:
+                variants = _tool_call_id_variants(tc)
+                if variants and variants & seen_assistant_call_ids:
                     removed_dupes += 1
                     continue
-                if cid:
+                for cid in variants:
                     seen_assistant_call_ids.add(cid)
                     outstanding_call_ids.add(cid)
+                    dedup_id_siblings[cid] = variants
                 kept_tcs.append(tc)
             if kept_tcs:
                 msg = {**msg, "tool_calls": kept_tcs}
@@ -3719,11 +3861,13 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 removed_dupes += 1
                 continue
             if cid:
-                # Answered: this id is no longer outstanding, so a second
-                # result replaying it is still caught above.
-                outstanding_call_ids.discard(cid)
-                # A reused id must be re-armable by the next assistant call.
-                seen_assistant_call_ids.discard(cid)
+                # Answered: consume EVERY variant of the matched call so a
+                # second result replaying either sibling is still caught
+                # above, and the ids are re-armable by the next assistant
+                # call that reuses them.
+                for sibling in dedup_id_siblings.get(cid, {cid}):
+                    outstanding_call_ids.discard(sibling)
+                    seen_assistant_call_ids.discard(sibling)
             deduped.append(msg)
         else:
             deduped.append(msg)
@@ -3836,6 +3980,37 @@ def looks_like_codex_intermediate_ack(
         marker in assistant_text for marker in workspace_markers
     )
     return user_targets_workspace or assistant_targets_workspace
+
+
+# Conservative "trailing continue-intent" detector for the said-continue-but-
+# stopped stall guard (agent.stall_guards). Matches only when the message TAIL
+# announces an immediate next action ("Let me now…", "I will now…",
+# "Next, I…"), which is the observed stall shape: the model narrates the next
+# step and then ends the turn with no tool call. Kept deliberately narrow so
+# ordinary answers that merely contain "I will" mid-sentence never trip it.
+_TRAILING_CONTINUE_INTENT_RE = re.compile(
+    r"(?:\blet me now\b|\bi(?:['\u2019])?ll now\b|\bi will now\b"
+    r"|\bnow i(?:['\u2019]ll| will)\b|\bnext[,:] i\b)"
+    r"[^.!?\n]{0,100}[.:\u2026]?\s*$",
+    re.IGNORECASE,
+)
+
+# Content longer than this is a substantive reply, not a dangling ack.
+_TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
+
+
+def trailing_continue_intent(text: str) -> bool:
+    """Whether ``text`` is a short reply ENDING on an announced next action.
+
+    Used by the stall-guard extension of the intent-ack continuation path in
+    ``agent.conversation_loop``: when a turn is about to end with this shape
+    (no tool calls, short content, trailing intent), the loop re-prompts via
+    the existing bounded continuation mechanism instead of stopping.
+    """
+    t = (text or "").strip()
+    if not t or len(t) > _TRAILING_CONTINUE_INTENT_MAX_CHARS:
+        return False
+    return bool(_TRAILING_CONTINUE_INTENT_RE.search(t[-160:]))
 
 
 def intent_ack_continuation_mode(agent) -> str:
