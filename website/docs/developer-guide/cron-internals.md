@@ -140,7 +140,14 @@ dropped silently. The mechanics, in the order the due scan applies them
 3. **Already fired → never twice.** `completed_occurrence()` consults the
    executions ledger for a `completed` row with that exact `scheduled_instant`
    before anything is due; a slot that ran before the restart advances without
-   firing. `failed` / `unknown` rows do not count as completion.
+   firing. `failed` / `unknown` rows do not count as completion, and neither
+   does a `completed` row whose `finished_at` (else `claimed_at`) precedes the
+   instant it is stamped with — a run cannot prove an occurrence that had not
+   happened yet. Rows without a comparable timestamp keep counting.
+   An occurrence identity is only claimable once it is due: `claim_job_for_fire`
+   drops a `scheduled_instant` that is still in the future, so an off-tick fire
+   (dashboard trigger, webhook, lease reclaim, misfire backstop) runs
+   occurrence-free instead of consuming the next slot.
 4. **Late within grace → fire late.** Grace = half the period clamped to
    `[120 s, 2 h]` (`_compute_grace_seconds`); the dispatch is stamped
    `last_dispatch.kind = late`.
@@ -148,8 +155,13 @@ dropped silently. The mechanics, in the order the due scan applies them
    with a logged reason when the operator set `cron.catch_up_missed: false`
    (planned downtime). One-shots past their 120 s grace are retired with a
    diagnostic, never resurrected.
-6. **Paused / disabled / terminal jobs never catch up**; the due scan drops them
-   before any of the above, and pause/resume clears any pending slot.
+6. **Paused / disabled / terminal jobs never fire**; the due scan drops them
+   before any of the above, and pause/resume clears any pending slot. A
+   recurring occurrence that came due *while paused* is not lost, though:
+   `resume_job` keeps a past stored `next_run_at` as the due instant instead of
+   re-anchoring from now (and logs that it did), so the first tick after
+   resume applies rules 3–5 to it — one late/catch-up run, or a logged skip.
+   One-shots and future instants recompute from now on resume.
 
 The same store fields drive every topology: a standalone `hermes -p X gateway
 run` and a profile served by the default multiplexer (`_start_multiplex` ticks
