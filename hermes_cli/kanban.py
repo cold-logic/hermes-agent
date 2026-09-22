@@ -341,6 +341,16 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 def _cmd_create(args: argparse.Namespace) -> int:
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
+    body = args.body
+    body_file = getattr(args, "body_file", None)
+    if body is not None and body_file is not None:
+        return _err("kanban: --body and --body-file are mutually exclusive", 2)
+    if body_file is not None:
+        try:
+            body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            return _err(f"kanban: --body-file: {exc}", 2)
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -358,7 +368,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     "use 1 to trip on the first failure.", 2)
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
-            conn, title=args.title, body=args.body, assignee=args.assignee,
+            conn, title=args.title, body=body, assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
@@ -752,11 +762,18 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                                   tuple(diags_by_task.keys())):
                 meta[r["id"]] = {k: r[k] for k in ("title", "status", "assignee")}
 
+    # What this home believes it may claim on a shared board (#113620).
+    allowlist = kbd.dispatch_profile_allowlist_summary()
+
     if getattr(args, "json", False):
+        # Per-task rows unchanged; the home-scope allowlist rides as a trailing row
+        # (task_id null) so existing `payload[0]["diagnostics"]` consumers keep working.
         _print_json([{"task_id": tid, **meta.get(tid, {}), "diagnostics": [d.to_dict() for d in dl]}
-                     for tid, dl in diags_by_task.items()])
+                     for tid, dl in diags_by_task.items()]
+                    + [{"task_id": None, "dispatch_profiles": allowlist, "diagnostics": []}])
         return 0
 
+    print(f"kanban.dispatch_profiles: {allowlist}")
     if not diags_by_task:
         print("No active diagnostics on this board.")
         return 0
@@ -995,6 +1012,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
                                  f"--force to close its run and complete anyway.")
                 return False
+            except kb.EmptyCompletionError as empty_err:
+                fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
+                                 f"describing what was done (an empty completion is not evidence).")
+                return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
                 # name the open parents instead of claiming the id is unknown.
@@ -1009,13 +1030,29 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
 
 def _cmd_edit(args: argparse.Namespace) -> int:
-    metadata, rc = _parse_metadata_flag(getattr(args, "metadata", None))
+    result = getattr(args, "result", None)
+    raw_metadata = getattr(args, "metadata", None)
+    summary = getattr(args, "summary", None)
+    title = getattr(args, "title", None)
+    body = getattr(args, "body", None)
+    priority = getattr(args, "priority", None)
+    if result is None and (summary is not None or raw_metadata is not None):
+        return _err("kanban edit: --summary and --metadata require --result", 2)
+    if all(value is None for value in (title, body, priority, result)):
+        return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+    metadata, rc = _parse_metadata_flag(raw_metadata)
     if rc:
         return rc
     with kbc.connect_closing() as conn:
-        ok = kb.edit_completed_task_result(conn, args.task_id, result=args.result,
-                                           summary=getattr(args, "summary", None), metadata=metadata)
-    return _ok_or_err(ok, f"cannot edit {args.task_id} (unknown id or task is not done)", f"Edited {args.task_id}")
+        ok = kb.edit_task(
+            conn, args.task_id, title=title, body=body, priority=priority,
+            result=result, summary=summary, metadata=metadata,
+        )
+    return _ok_or_err(
+        ok,
+        f"cannot edit {args.task_id} (unknown id, or --result used on a task that is not done)",
+        f"Edited {args.task_id}",
+    )
 
 
 def _commented(conn, reason: Optional[str], author, prefix: str, op):

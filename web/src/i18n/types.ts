@@ -322,6 +322,8 @@ export interface Translations {
     noJobs: string;
     last: string;
     next: string;
+    overdueSince?: string;
+    schedulerLastTicked?: string;
     pause: string;
     resume: string;
     triggerNow: string;
@@ -343,6 +345,7 @@ export interface Translations {
     disableRuntime: string;
     enableAfterInstall: string;
     enableRuntime: string;
+    toggleTakesEffectAfterRestart: string;
     forceReinstall: string;
     headline: string;
     identifierLabel: string;

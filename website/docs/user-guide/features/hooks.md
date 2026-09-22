@@ -11,7 +11,7 @@ Hermes has four hook systems that run custom code at key lifecycle points:
 | System | Registered via | Runs in | Use case |
 |--------|---------------|---------|----------|
 | **[Gateway hooks](#gateway-event-hooks)** | `HOOK.yaml` + `handler.py` in `~/.hermes/hooks/` | Gateway only | Logging, alerts, webhooks |
-| **[Plugin hooks](#plugin-hooks)** | `ctx.register_hook()` in a [plugin](/user-guide/features/plugins) | CLI + Gateway | Tool interception, metrics, guardrails |
+| **[Plugin hooks](#plugin-hooks)** | `ctx.register_hook()` in a [plugin](./plugins.md) | CLI + Gateway | Tool interception, metrics, guardrails |
 | **[Shell hooks](#shell-hooks)** | `hooks:` block in profile `config.yaml` pointing at shell scripts | CLI + Gateway + Desktop/TUI/dashboard chat | Drop-in scripts for blocking, auto-formatting, context injection |
 | **[Outbound webhooks](#outbound-webhooks)** | `hooks.outbound:` list in `~/.hermes/config.yaml` | CLI + Gateway | Push signed lifecycle events to external HTTP endpoints — CI, dashboards, other agents |
 
@@ -360,10 +360,10 @@ Gateway hooks only fire in the **gateway** (Telegram, Discord, Slack, WhatsApp, 
 
 ## Plugin Hooks
 
-[Plugins](/user-guide/features/plugins) can register hooks that fire in **both CLI and gateway** sessions. These are registered programmatically via `ctx.register_hook()` in your plugin's `register()` function.
+[Plugins](./plugins.md) can register hooks that fire in **both CLI and gateway** sessions. These are registered programmatically via `ctx.register_hook()` in your plugin's `register()` function.
 
 For plugin packaging and registration details, see
-the [Plugins guide](/docs/user-guide/features/plugins).
+the [Plugins guide](./plugins.md).
 
 ```python
 def register(ctx):
@@ -438,7 +438,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 
 | Hook | Category | Exact timing and return behavior | Explicit payload fields | Privacy / sensitivity |
 |---|---|---|---|---|
-| [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; first valid `block` or `approve` directive wins, and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
+| [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; any valid `block` wins over any `approve` (then the first valid `approve`), and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
@@ -554,7 +554,7 @@ return {"action": "block", "message": "Reason the tool call was blocked"}
 return {"action": "approve", "message": "Why approval is required", "rule_key": "optional:scope"}
 ```
 
-The first valid directive wins (Python plugins registered first, then shell hooks). `block` requires a non-empty `message` and short-circuits the tool with that text as the error returned to the model. `approve` escalates the call to the existing human-approval gate; `message` and `rule_key` are optional, and denial, timeout, or gate error fails closed. Other return values are ignored, so existing observer-only callbacks keep working unchanged.
+Precedence is `block` > `approve` > no directive, regardless of registration order: any plugin's valid `block` wins over an earlier plugin's `approve`, and among `approve` directives the first valid one wins (Python plugins are registered first, then shell hooks). `block` requires a non-empty `message` and short-circuits the tool with that text as the error returned to the model. `approve` escalates the call to the existing human-approval gate; `message` and `rule_key` are optional, and denial, timeout, or gate error fails closed. Other return values are ignored, so existing observer-only callbacks keep working unchanged.
 
 **Return value — rewrite the tool's arguments:**
 
@@ -572,7 +572,7 @@ Shell hooks also accept the Claude Code-compatible format:
 
 Both formats are normalized internally to `{"action": "modify", "args": {...}}`.
 
-If a `pre_tool_call` callback exceeds `plugins.hook_callback_timeout` (or is still running from a previous timed-out fire), Hermes **fails closed**: the tool is blocked with a timeout message rather than proceeding without a policy decision.
+If a `pre_tool_call` callback exceeds `plugins.hook_callback_timeout` (or is still running from a previous timed-out fire), Hermes **fails closed**: the tool is blocked with a timeout message rather than proceeding without a policy decision. The same applies to a callback that raises: the block message names the callback and the error. A hung callback is skipped for a 60s suppression window; after that a new tool call runs it again (up to three abandoned workers per callback, so a permanently hung plugin blocks tool calls with a warning naming it instead of silently wedging the agent until restart).
 
 **Use cases:** Logging, audit trails, tool call counters, blocking dangerous operations, rate limiting, per-user policy enforcement, argument sanitization, path rewriting, injecting default parameters.
 
@@ -1043,7 +1043,7 @@ def my_callback(session_id: str, platform: str, **kwargs):
 
 ---
 
-See the **[Build a Plugin guide](/developer-guide/plugins)** for the full walkthrough including tool schemas, handlers, and advanced hook patterns.
+See the **[Build a Plugin guide](../../developer-guide/plugins/index.md)** for the full walkthrough including tool schemas, handlers, and advanced hook patterns.
 
 ---
 
@@ -1213,6 +1213,8 @@ def my_callback(event, gateway, session_store, **kwargs):
 **Fires:** In `gateway/run.py`, inside `GatewayRunner._handle_message()`, immediately after `is_internal` is computed. **Internal events skip the hook entirely** (they are system-generated — background-process completions, etc. — and must not be gate-kept by user-facing policy).
 
 **Return value:** `None` or a dict. The first recognized action dict wins; remaining plugin results are ignored. Exceptions in plugin callbacks are caught and logged; the gateway always falls through to normal dispatch on error.
+
+Callbacks may be `async def`: they are awaited on the gateway's own event loop, so awaiting loop-bound work (an `asyncio.Event`, an aiohttp session, `asyncio.to_thread`) makes progress and other inbound messages keep flowing while the callback runs. The hook is intentionally not bounded by `plugins.hook_callback_timeout` — dropping or passing a message on timeout are both wrong for a policy gate — so a callback that never returns holds up dispatch of that message.
 
 | Return | Effect |
 |--------|--------|
@@ -1391,7 +1393,7 @@ def register(ctx):
 
 ### `on_room_member_activity`
 
-Fires while a hosted [Group Chat](/user-guide/bot-mode#groups-and-group-chats) member turn runs. A member executes on a hidden `Group: <room>` session that no client is attached to, so between the room log's `turn.started` and `turn.settled` the turn is a black box. This hook projects the runtime events that session already produces — tool start/complete, approval requests, streamed text and reasoning, errors — stamped with the room coordinates, so a client (Hermes Crew, a dashboard, an audit log) can render tool cards, approval prompts and live member status without inferring anything from text. The Group Chat runtime keeps ownership of execution, scheduling and the durable log; plugins only observe.
+Fires while a hosted [Group Chat](../bot-mode.md#groups-and-group-chats) member turn runs. A member executes on a hidden `Group: <room>` session that no client is attached to, so between the room log's `turn.started` and `turn.settled` the turn is a black box. This hook projects the runtime events that session already produces — tool start/complete, approval requests, streamed text and reasoning, errors — stamped with the room coordinates, so a client (Hermes Crew, a dashboard, an audit log) can render tool cards, approval prompts and live member status without inferring anything from text. The Group Chat runtime keeps ownership of execution, scheduling and the durable log; plugins only observe.
 
 **Callback signature:**
 
@@ -1458,7 +1460,7 @@ def my_callback(
 | `provider` | `str` | Resolved STT provider (`local`, `groq`, `openai`, `mistral`, `xai`, `elevenlabs`, `deepinfra`, `local_command`, a command provider name, or a plugin provider name). |
 | `model` | `str \| None` | Model resolved so far, or `None` when the backend default applies. |
 | `language` | `str \| None` | Language from the provider's config section, or `None`. |
-| `prompt` | `str \| None` | The static [`stt.prompt`](/user-guide/configuration#transcription-prompt-vocabulary-hints) value, or `None`. |
+| `prompt` | `str \| None` | The static [`stt.prompt`](../configuration.md#transcription-prompt-vocabulary-hints) value, or `None`. |
 | `source` | `str \| None` | Caller surface label (`gateway`, `voice_mode`, …). Observability only, not used for dispatch. |
 
 **Return value:** a `dict` with any of `"prompt"`, `"language"`, `"model"` mapped to strings, or `None` to leave the request unchanged. Non-string values, unknown keys, and `file_path` are ignored (`file_path` attempts are logged as a warning). Results are applied in **registration order, last-writer-wins per field**, on top of the `stt.prompt` config value. Returning `""` for `prompt` clears the configured prompt for that request.
@@ -1477,7 +1479,7 @@ def register(ctx):
     ctx.register_hook("pre_transcription", add_vocab)
 ```
 
-Not every backend accepts a prompt. `local` maps it to faster-whisper's `initial_prompt`; `openai`, `groq`, `mistral`, and `deepinfra` send it as `prompt`; `xai`, `elevenlabs`, `local_command`, and `type: command` providers log at DEBUG and transcribe without it. See the [provider support table](/user-guide/configuration#transcription-prompt-vocabulary-hints) for the full matrix and the privacy boundary. Hook-plumbing errors are fail-open: the dispatch continues with the unmodified request.
+Not every backend accepts a prompt. `local` maps it to faster-whisper's `initial_prompt`; `openai`, `groq`, `mistral`, and `deepinfra` send it as `prompt`; `xai`, `elevenlabs`, `local_command`, and `type: command` providers log at DEBUG and transcribe without it. See the [provider support table](../configuration.md#transcription-prompt-vocabulary-hints) for the full matrix and the privacy boundary. Hook-plumbing errors are fail-open: the dispatch continues with the unmodified request.
 
 ---
 
@@ -1517,6 +1519,8 @@ Applies to every tool. For terminal-only rewriting see `transform_terminal_outpu
 ### `transform_terminal_output`
 
 Fires inside the `terminal` tool after foreground process capture has already been bounded by the environment, and before the final output limit. It lets plugins replace the captured stdout/stderr; the replacement is still subject to the final output limit.
+
+It also fires for background-process output on its way to the model or the chat: the `process_manage` `poll` / `wait` / `log` / `kill` results (and `list` previews) and the completion, heartbeat and watch-pattern notifications. There `returncode` is `None` while the process is still running and `env_type` is an empty string (the environment is not recorded per process). In both cases the hook runs *before* secret redaction, so a replacement that still carries a credential is masked.
 
 **Callback signature:**
 
@@ -1559,7 +1563,7 @@ Pairs with `transform_tool_result`, which runs afterward for every tool, includi
 
 ### `transform_llm_output`
 
-Fires **once per turn** after the tool-calling loop completes and the model has produced a final response, **before** that response is delivered to the user (CLI, gateway, or programmatic caller). Lets a plugin rewrite the assistant's final text using classical-programming methods — no extra inference tokens burned on SOUL flavor text or a skill-driven transform.
+Fires **once per turn** after the tool-calling loop completes and the model has produced a final response, **before** that response is delivered to the user (CLI, gateway, or programmatic caller) and **before** the assistant row is persisted — the replacement is what the session stores, what `/resume` shows and what the next turn replays, so the transcript never diverges from what the user saw. Hermes' own trailers (the file-mutation warning, the abnormal-exit note) are appended afterwards and are not part of `response_text`. Lets a plugin rewrite the assistant's final text using classical-programming methods — no extra inference tokens burned on SOUL flavor text or a skill-driven transform.
 
 **Callback signature:**
 
@@ -1694,6 +1698,8 @@ hooks_auto_accept: false         # See "Consent model" below
 
 Event names must be one of the [plugin hook events](#plugin-hooks); typos produce a "Did you mean X?" warning and are skipped. Unknown keys inside a single entry are ignored; missing `command` is a skip-with-warning. `timeout > 300` is clamped with a warning. `fail_closed: true` on an event other than `pre_tool_call` warns and is ignored (only blocking-capable events can fail closed).
 
+On Windows, a `command` that starts with an existing script file — the `~/.hermes/agent-hooks/x.sh` shape the examples below use — is spawned through that file's own interpreter (Git Bash for `.sh`/`.bash`, the running Hermes Python for `.py`), because `CreateProcess` has no shebang support and rejects a bare script with `WinError 193`. Every other command, and every POSIX platform, passes `argv` straight to `Popen`, where the kernel already honours the shebang.
+
 ### JSON wire protocol
 
 Each time the event fires, Hermes spawns a subprocess for every matching hook (matcher permitting), pipes a JSON payload to **stdin**, and reads **stdout** back as JSON.
@@ -1726,6 +1732,10 @@ profile's `HERMES_HOME`. `tool_name` and `tool_input` are `null` for non-tool ev
 // Modify a pre_tool_call — rewrite tool args before dispatch:
 {"action": "modify", "args": {"new_string": "fixed content"}}         // Hermes-canonical
 {"decision": "modify", "tool_input": {"new_string": "fixed content"}} // Claude-Code style
+
+// Escalate a pre_tool_call to the human-approval gate (Hermes-only; `message` and `rule_key`
+// are optional). Claude-Code's `{"decision": "approve"}` means auto-allow and is NOT mapped here:
+{"action": "approve", "message": "Why approval is required", "rule_key": "optional:scope"}
 
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}
@@ -1917,11 +1927,11 @@ Shell hooks run with **your full user credentials** — same trust boundary as a
 
 ### Ordering and precedence
 
-Both Python plugin hooks and shell hooks flow through the same `invoke_hook()` dispatcher. Python plugins are registered first (`discover_and_load()`), shell hooks second (`register_from_config()`), so Python `pre_tool_call` block decisions take precedence in tie cases. The first valid block wins — the aggregator returns as soon as any callback produces `{"action": "block", "message": str}` with a non-empty message.
+Both Python plugin hooks and shell hooks flow through the same `invoke_hook()` dispatcher. Python plugins are registered first (`discover_and_load()`), shell hooks second (`register_from_config()`), so Python `pre_tool_call` decisions take precedence in tie cases. The first valid block wins — the aggregator returns as soon as any callback produces `{"action": "block", "message": str}` with a non-empty message — and a block anywhere in the list outranks an `approve` returned earlier.
 
 ## Outbound Webhooks
 
-Outbound webhooks are the push-side mirror of the [inbound webhook platform](/user-guide/messaging/webhooks): inbound webhooks wake Hermes when the world changes; outbound webhooks tell the world when Hermes does something. Configure a list of HTTP endpoints and the lifecycle events they care about, and Hermes POSTs a signed JSON payload to each endpoint whenever a matching event fires — no polling on the receiving end.
+Outbound webhooks are the push-side mirror of the [inbound webhook platform](../messaging/webhooks.md): inbound webhooks wake Hermes when the world changes; outbound webhooks tell the world when Hermes does something. Configure a list of HTTP endpoints and the lifecycle events they care about, and Hermes POSTs a signed JSON payload to each endpoint whenever a matching event fires — no polling on the receiving end.
 
 Typical uses:
 

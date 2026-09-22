@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -159,13 +159,13 @@ def _mark_exited_quietly(exit_code: int, reason: str) -> None:
         # Only the supervisor-restart code asserts a restart; other codes leave the recorded
         # operator intent (a restart-drain that wedged is still a requested restart) untouched.
         restart = {"restart_requested": True} if exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE else {}
-        write_runtime_status(gateway_state="degraded", exit_reason=reason, **restart)
+        write_runtime_status(
+            gateway_state="degraded", exit_reason=reason, wait_timeout=0.25, **restart)
 
 
 def _process_hermes_home() -> Path:
     """HERMES_HOME for process-level identity files (ignore profile overrides)."""
-    val = os.environ.get("HERMES_HOME", "").strip()
-    return Path(val) if val else get_hermes_home()
+    return get_process_hermes_home() if os.environ.get("HERMES_HOME", "").strip() else get_hermes_home()
 
 
 def _home(home: Optional[Path]) -> Path:
