@@ -11,6 +11,50 @@ encountered, fork-specific changes verified, and deployment impact.
 
 ---
 
+## 2026-09-30 — post-v2026.9.24 sync
+
+- **Merge commit**: `e4e9c07953a0` — "Merge upstream/main into fork (v2026.9.30 sync)"
+- **Upstream HEAD**: `f42f579cf8` — "Merge pull request #128011 from rroverin/fix/escape-drift-newline-doubling"
+- **Upstream release**: still `v2026.9.24` (Hermes v0.21.5) — no new tag; all
+  commits are pre-release work since the tag
+- **Commits merged**: 1,960
+- **Previous sync**: 2026-09-26 (v2026.9.24 / v0.21.5)
+- **GHCR digest**: `sha256:2c8fb6738e7950b06d1f915a1bf3b52b0f47cbeb0412fcdfdd74a231c628835a`
+- **Running version**: `v0.21.5+4924 (2026.9.24)`
+
+### Conflicts
+
+None — clean merge.
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py` ✓
+- lifecycle_guard data-file exclusion (`_DATA_EXTENSIONS`) ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+
+### Build notes
+
+- Install stamp regenerated for merge commit `e4e9c079` (distance 4,924 from
+  `v2026.9.24` tag). `+4924` counts all upstream commits plus the fork-specific
+  commits and merge commits — expected, see 2026-09-26 entry.
+- Deployment-side issue: **nub 0.9.5's package layout changed** (mise now ships
+  it as a native ELF binary tree `bin/{nub,nubx,nubr,nub-launcher-*}` +
+  `runtime/` instead of the npm-backed `@nubjs/nub` JS launcher). The
+  deployment Dockerfile's `NODE_PATH` wrapper scripts broke
+  (`MODULE_NOT_FOUND`). Fixed by copying the tree to `/usr/local/lib/nub` and
+  symlinking `bin/{nub,nubx}` into `/usr/local/bin`. Fixed in deployment repo,
+  not this fork.
+
+### Deployment impact
+
+- Fork image built locally, tagged `ghcr.io/cold-logic/hermes-agent:latest`
+  locally, then pushed to GHCR (no Actions credits)
+- Deployment image rebuilt, `hermes` container recreated
+- All containers healthy
+
+---
+
 ## 2026-09-26 — v2026.9.24 sync
 
 - **Merge commit**: `4c51473059c9` — "Merge upstream/main into fork (v2026.9.26 sync)"
