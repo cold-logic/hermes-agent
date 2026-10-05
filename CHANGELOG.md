@@ -11,6 +11,59 @@ encountered, fork-specific changes verified, and deployment impact.
 
 ---
 
+## 2026-10-05 — post-v2026.9.24 sync
+
+- **Merge commit**: `144e9f9b197d` — "Merge upstream/main into fork (2026-10-05 sync)"
+- **Upstream HEAD**: `b4bf19d8148a` — "fix(desktop): Review scope tabs get their own row and a narrow dropdown"
+- **Upstream release**: still `v2026.9.24` (Hermes v0.21.5) — no new tag; all
+  commits are pre-release work since the tag
+- **Commits merged**: 2,432
+- **Previous sync**: 2026-09-30 (post-v2026.9.24 / v0.21.5+4924)
+- **GHCR digest**: none — image built locally and tagged
+  `ghcr.io/cold-logic/hermes-agent:latest` **but not pushed** this pass
+  (build-local-only choice); registry `latest` still points at the 2026-09-30 image
+- **Running version**: `v0.21.5+7358 (2026.9.24) · upstream 144e9f9b`
+- **Pushed**: `git push origin main` → `a59b70ac12..144e9f9b19`
+
+### Conflicts
+
+None — clean merge despite the size (1,706 upstream files touched; zero overlap
+with the fork payload). Diff of merge commit vs upstream tip is exactly the
+9-file fork delta (+1,249).
+
+Bookkeeping note: `main` arrived as a three-way conflicted bookmark after fetch
+(local tip vs upstream tip vs the stale `f42f579c` position); resolved by
+`jj bookmark set main -r <merge>` per the standard recipe.
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`, kanban_db.py:115) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py` ✓
+- lifecycle_guard data-file exclusion (`_DATA_EXTENSIONS`) ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+- Upstream auth reset (`status_cleared_ids` in `agent/credential_pool_admin.py`)
+  present — fork's redundant version stays retired ✓
+- jj symbol map unchanged (still `kanban_db_workspace.py` + `kanban.py`); both
+  `_JJ_CANDIDATES`/`_JJ2` lists keep `/usr/local/bin/jj` first ✓
+
+### Build notes
+
+- Install stamp regenerated for merge commit `144e9f9b` (distance 7,358 from
+  `v2026.9.24`). `+7358` counts upstream + fork commits since the tag — expected.
+- Same pass bumped deployment pins: mise 2026.10.3, agy 1.2.17, devin
+  3000.11.31 (noncontiguous publish — 3000.11.30/.31 exist, neighbors 403),
+  nub 0.9.6 (kept the native-ELF tree layout), nmem 0.10.95, ollama digest.
+
+### Deployment impact
+
+- Fork image `hermes-agent-fork-test:latest` (`9d7a249848c7…`) built locally,
+  tagged `ghcr.io/cold-logic/hermes-agent:latest` locally — **not pushed to
+  GHCR**; do `docker push ghcr.io/cold-logic/hermes-agent:latest` when ready
+- Deployment image rebuilt (`e66228a25883…`), `hermes`/`nowledge-mem`/`ollama`
+  recreated; all services healthy, gatekeeper active, gateway running under s6
+
+---
+
 ## 2026-09-30 — post-v2026.9.24 sync
 
 - **Merge commit**: `e4e9c07953a0` — "Merge upstream/main into fork (v2026.9.30 sync)"
