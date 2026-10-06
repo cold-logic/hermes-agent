@@ -11,6 +11,75 @@ encountered, fork-specific changes verified, and deployment impact.
 
 ---
 
+## 2026-10-06 — post-v2026.9.24 sync (+ carried web typecheck patch)
+
+- **Merge commit**: `7232a0bfc367` — "Merge upstream/main into fork (2026-10-06 sync)"
+- **Carried patch**: `fdbc23daf077` — "fix(dashboard): typecheck-clean
+  ChatSessionList test mock (fork)". Upstream merged
+  `web/src/components/ChatSessionList.test.tsx` today (`39ac8f2b`, touched again
+  by `da1bf11`) with two errors the Docker web build's solution-builder
+  typecheck rejects: bare `globalThis.IS_REACT_ACT_ENVIRONMENT` (TS7017) and
+  `ghost`/`outlined`/`size` destructured off `ButtonHTMLAttributes` (TS2339).
+  Fixed matching sibling-test conventions (globalThis cast + extended mock prop
+  type). **Drop when upstream fixes the file.**
+- **Upstream HEAD**: `04dc1c6e` — "fix(lint): stdin guard reads only real stdin
+  settings; unbroker key generation leaves no partial file (review)"
+- **Upstream release**: `v2026.9.24` remains the last tag with a real
+  `pyproject.toml` version (`0.21.5`). Upstream's tag scheme changed: daily
+  `v0.21.4+canary.<date>` + `rc.NN-v0.21.5` RCs — the `v20*` glob is dead.
+- **Commits merged**: 1,018 (behind went 2,432 → 0 across yesterday+today)
+- **GHCR digest**: `sha256:e1637299630c3b843b195b5ae25a4dfb6f369703e3ac71e37043724510300c25`
+  (pushed `ghcr.io/cold-logic/hermes-agent:latest`)
+- **Running version**: `v0.21.5+8379 (2026.9.24) · upstream fdbc23da`
+- **Pushed**: `git push origin main` → `d93853918c..7232a0bfc3` (merge), then
+  `7232a0bfc3..fdbc23daf0` (patch)
+
+### Conflicts
+
+None — clean merge (upstream touched ~1,200 files; zero overlap with the fork
+payload). Diff of merge commit vs upstream tip is exactly the 9-file fork delta
+(+1,302, incl. yesterday's CHANGELOG entry).
+
+Bookkeeping note: `main` again arrived as a conflicted bookmark after fetch
+(local tip `d9385391` vs upstream tip `04dc1c6e` vs stale `b4bf19d8`); resolved
+by `jj bookmark set main -r d9385391` before creating the merge.
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`, kanban_db.py:115) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py:448` ✓
+- lifecycle_guard `_DATA_EXTENSIONS` (:308, 12 entries; applied :1011) ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+- Upstream auth reset (`status_cleared_ids`,
+  `agent/credential_pool_admin.py:30,53`) present ✓
+- jj symbol map: all three `def`s still in `kanban_db_workspace.py`; every
+  `_JJ_CANDIDATES`/`_JJ2` list (6 sites — 2 in `kanban_db_workspace.py`, 4 in
+  `kanban.py`) keeps `/usr/local/bin/jj` first. Line numbers drifted;
+  `stages/02_fork_sync/references/fork-internals.md` in the deployment repo
+  refreshed ✓
+
+### Build notes
+
+- Install stamp regenerated for `fdbc23da` — distance 8,379 from `v2026.9.24`
+  (`0.21.5+8379`; counts upstream + fork commits since the tag — expected).
+- First `docker build` FAILED at `frontend_build` (the upstream test-file
+  typecheck above); rebuild after `fdbc23da` was clean.
+- Same pass bumped deployment pins: node `26-bookworm-slim` digest
+  (`3ffc19ea…`), ollama digest (`1bef6397…`), nmem 0.10.96, agy 1.3.0, devin
+  3000.11.35. direnv 2.38.1 deferred (released same-day; mise aqua registry
+  lag — `mise ls-remote direnv` topped at 2.37.1).
+
+### Deployment impact
+
+- `hermes`, `nowledge-mem`, `ollama` recreated; `tailscale`/`browser`
+  untouched. All s6 longruns up, 6/6 overmind procs running, all gateway
+  platforms (webhook/api_server/telegram/discord/mattermost/zulip) connected.
+- New upstream behavior surfaced: `left_core_migration` auto-installs left-core
+  plugins — `homeassistant` install denied by the root-owned
+  `/opt/data/plugins` tree (run `hermes plugins install homeassistant` if HA is
+  wanted). New `fallback_providers` validation warns the deployed config.yaml
+  stores it as a quoted string (pre-existing; every reader ignores it).
+
 ## 2026-10-05 — post-v2026.9.24 sync
 
 - **Merge commit**: `144e9f9b197d` — "Merge upstream/main into fork (2026-10-05 sync)"
