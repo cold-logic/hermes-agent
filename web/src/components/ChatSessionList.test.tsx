@@ -20,11 +20,7 @@ vi.mock('@nous-research/ui/ui/components/button', () => ({
     prefix,
     size,
     ...props
-  }: React.ButtonHTMLAttributes<HTMLButtonElement> & {
-    ghost?: boolean
-    outlined?: boolean
-    size?: string
-  }) => {
+  }: React.ButtonHTMLAttributes<HTMLButtonElement> & { ghost?: boolean; outlined?: boolean; size?: string }) => {
     void ghost
     void outlined
     void prefix
