@@ -11,6 +11,58 @@ encountered, fork-specific changes verified, and deployment impact.
 
 ---
 
+## 2026-10-08 — sync to upstream `38880bd2`; carried test patch absorbed
+
+- **Merge commit**: `64a2471592` — "Merge upstream/main into fork (2026-10-08 sync)"
+- **Upstream HEAD**: `38880bd2` — "fix(s6): read the supervised pid from
+  s6-svstat -o, not the status line"
+- **Upstream release**: `v0.21.6` tag exists now, but its `pyproject.toml` still
+  reads `0.0.0` → `v2026.9.24` (`0.21.5`) remains the install-stamp base.
+- **Commits merged**: 956 (behind 956 → 0; ahead 25 → 26 with the merge)
+- **GHCR digest**: `sha256:8cea979a5e402185cec415c1c126df0c4d2f635157f038623dc5da21721ffd40`
+  (locally built `hermes-agent-fork-test` `613394a9`, tagged + pushed)
+- **Running version**: `v0.21.5+9337 (2026.9.24) · upstream 64a24715`
+- **Pushed**: `git push origin main` → `7fda32aeba..64a2471592` (merge), then
+  `64a2471592..d73ff9be93` (empty stamp-marker commit — see note)
+
+### Conflicts
+
+**One**: `web/src/components/ChatSessionList.test.tsx` (2-sided). Upstream
+`eb6a3886f1` applied the same Button-mock typecheck fix our carried patch
+`fdbc23daf0` did (identical props; theirs single-line, ours multi-line).
+Resolved `:theirs` — **the carried patch is now fully absorbed; zero fork delta
+on that file**. The 10-06 "drop when upstream fixes" condition is met.
+
+Merge-vs-upstream diff is exactly the 9-file fork payload (+1,371/−5).
+
+### install-stamp mechanics (learned this sync)
+
+`install-stamp.json` is **gitignored upstream** (`.gitignore:278`, present before
+this merge) and was never committed in fork history — the Oct-6 session's
+`git ls-files` hit was stale index. It reaches the image anyway: the local
+`docker build` context (`COPY --link . .`, not dockerignored) picks it up off
+disk. The `d73ff9be` "chore: refresh install-stamp" commit pushed **empty**
+because jj never tracks the ignored file — regenerate the stamp on disk before
+building; don't commit it. Fork GHCR builds are local `docker push` (Actions
+queued indefinitely — all disabled), so nothing else consumes the stamp.
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`, kanban_db.py:115,
+  validated :1234) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py:448` ✓
+- lifecycle_guard `_DATA_EXTENSIONS` (:308, 12 entries; applied :1011) ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+- Upstream auth reset (`status_cleared_ids`,
+  `agent/credential_pool_admin.py`) present ✓
+- jj symbol map: all three `def`s still in `kanban_db_workspace.py`
+  (`_jj_notify` :361, `_cleanup_workspace` :436, `resolve_workspace` :1041);
+  every `_JJ_CANDIDATES`/`_JJ2` list (2 in `kanban_db_workspace.py`, 4 in
+  `kanban.py`) keeps `/usr/local/bin/jj` first ✓
+- Deployment-side pins also bumped this pass: mise 2026.10.4, agy 1.3.1,
+  devin 3000.11.39, direnv 2.38.1, pingap 0.15.0, nmem 0.10.97, ollama +
+  chromedp digest re-pins (deployment repo commit separately)
+
 ## 2026-10-06 — post-v2026.9.24 sync (+ carried web typecheck patch)
 
 - **Merge commit**: `7232a0bfc367` — "Merge upstream/main into fork (2026-10-06 sync)"
