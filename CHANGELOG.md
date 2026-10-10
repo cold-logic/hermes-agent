@@ -11,6 +11,59 @@ encountered, fork-specific changes verified, and deployment impact.
 
 ---
 
+## 2026-10-10 — sync to upstream `1f711b27`; Browser Use CLI becomes default browser surface
+
+- **Merge commit**: `c39f38ab95b29cc8510992381536129adfe84340` — "Merge
+  upstream/main into fork (2026-10-10 sync)"
+- **Upstream HEAD**: `1f711b275f` — "test(desktop): the source hand-off fixture
+  installs its loopback transport once"
+- **Upstream release**: `v0.21.6` tag exists but its `pyproject.toml` still reads
+  `0.0.0` → `v2026.9.24` (`0.21.5`) remains the install-stamp base.
+- **Commits merged**: 404 (behind 404 → 0; ahead 28 → 29 with the merge)
+- **GHCR digest**: `sha256:ac9b923762af0d47a4a1217af088dafc9aefc6b6c7c4dba71fd403696d11b720`
+  (locally built `hermes-agent-fork-test` `fc022181`, tagged + pushed)
+- **Running version**: `v0.21.5+9744 (2026.9.24) · upstream c39f38ab`
+- **Pushed**: `git push origin main` → `b6ec2221fe..c39f38ab95`
+
+### Conflicts
+
+**One**: `hermes_cli/kanban_db_workspace.py` — the late-bound import block at
+EOF. Upstream kept `from hermes_cli import kanban_db as _kb`; the fork side adds
+`from hermes_cli.kanban_db_notify import add_notify_sub`, which `_jj_notify`
+calls (module present in merged tree). Resolved keeping the fork side.
+
+Merge-vs-upstream diff is exactly the 9-file fork payload.
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py` ✓
+- lifecycle_guard `_DATA_EXTENSIONS` (12 entries) ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+- Upstream auth reset (`status_cleared_ids`) present ✓
+- jj symbol map: all three `def`s still in `kanban_db_workspace.py`; every
+  `_JJ_CANDIDATES`/`_JJ2` list keeps `/usr/local/bin/jj` first ✓
+- install-stamp regenerated on disk to `0.21.5+9744` (gitignored, not committed —
+  see 2026-10-08 mechanics note) ✓
+
+### Deployment impact (this pass)
+
+- Pin bumps: node `26-bookworm-slim` digest, ollama digest, nmem 0.10.99,
+  mise 2026.10.7, agy 1.3.3, devin 3000.11.51, jj 0.46.0 (10-08 deferral
+  cleared — now in mise registry). tmux 3.8 + direnv 2.38.2 still deferred.
+- **New upstream behavior — Browser Use CLI is the default browser surface**:
+  with `browser.backend` unset and `browser-harness` importable (it ships in the
+  PM-sealed env), `is_browser_use_cli_mode()` is true and `browser_exec`
+  (`tools/browser_use_cli.py`, `check_fn=is_browser_use_cli_mode`) replaces the
+  whole `browser_*` toolset — the `_browser_cdp_check → False` log lines are
+  correct gating, not a broken sidecar. The deployment's `browser.cdp_url`
+  sidecar still backs `browser_exec` sessions. `browser.backend: off` in
+  `config.yaml` restores the legacy tools if ever wanted.
+- Zulip adapter (volume-side plugin) needed `python_dependencies:
+  ["zulip>=0.9.0,<0.11"]` declared in `/opt/data/plugins/zulip/plugin.yaml` —
+  the gateway's sealed PM env never had the SDK (Dockerfile installs it only
+  into the unused base venv). Env rebuilt at boot → `✓ zulip connected`.
+
 ## 2026-10-08 — sync to upstream `38880bd2`; carried test patch absorbed
 
 - **Merge commit**: `64a2471592` — "Merge upstream/main into fork (2026-10-08 sync)"
