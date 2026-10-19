@@ -11,6 +11,44 @@ encountered, fork-specific changes verified, and deployment impact.
 
 ---
 
+## 2026-10-19 — sync to upstream `cc6b1f29`; clean 3-way merge across 5,587 commits
+
+- **Merge commit**: `bd880f0254da25b75792b3220763ff774eaf8b7e` — "Merge upstream/main into fork (2026-10-19 sync)"
+- **Upstream HEAD**: `cc6b1f299b` — "fix(desktop): an unhinted project-tree lookup reads the live gateway's profile"
+- **Upstream release**: `v0.22.2` release tag exists, but `pyproject.toml` version remains `0.0.0` → `v2026.9.24` (`0.21.5`) remains the install-stamp base.
+- **Commits merged**: 5,587 (behind 5,587 → 0; ahead 30 → 31 with the merge)
+- **GHCR digest**: `sha256:ff244753c6d3e9c95193d35335e330089edb196ff84ee05f5c4d96a6b545e3ec`
+  (locally built `hermes-agent-fork-test` `a692befa`, tagged + pushed)
+- **Running version**: `v0.21.5+15333 (2026.9.24) · upstream bd880f02`
+- **Pushed**: `git push origin main` → `afc9e6ca35..bd880f0254`
+
+### Conflicts
+
+**Zero**: Clean 3-way merge across 2,558 added files, 2,840 modified files, and 142 removed files.
+Merge-vs-upstream diff is strictly the 9-file fork payload.
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py` ✓
+- lifecycle_guard `_DATA_EXTENSIONS` (12 entries) ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+- Upstream auth reset (`status_cleared_ids`) present ✓
+- jj symbol map: all three `def`s still in `kanban_db_workspace.py`; every
+  `_JJ_CANDIDATES`/`_JJ2` list keeps `/usr/local/bin/jj` first ✓
+- install-stamp regenerated on disk to `0.21.5+15333` (gitignored, not committed) ✓
+
+### Deployment impact (this pass)
+
+- Pin bumps: node `26-bookworm-slim` digest, ollama digest, tailscale digest,
+  chromedp headless-shell digest, nmem 0.10.103, mise 2026.10.15, agy 1.4.2,
+  devin 3000.11.111, direnv 2.38.2 (10-10 deferral cleared), pingap 0.16.1.
+  tmux 3.8 still deferred (mise registry lag).
+- All 5 containers recreated and verified healthy: `hermes`, `nowledge-mem`,
+  `ollama`, `tailscale`, `browser`.
+
+---
+
 ## 2026-10-10 — sync to upstream `1f711b27`; Browser Use CLI becomes default browser surface
 
 - **Merge commit**: `c39f38ab95b29cc8510992381536129adfe84340` — "Merge
