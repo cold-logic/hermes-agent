@@ -10,6 +10,50 @@ Each entry records the date, merge commit, upstream sync point, conflicts
 encountered, fork-specific changes verified, and deployment impact.
 
 ---
+---
+
+## 2026-11-02 — sync to upstream `30ee54ee`; clean 3-way merge across 4,293 commits
+
+- **Merge commit**: `0a1530bb28e326eb0a93af68d305b323ace868fd` — "Merge upstream/main into fork (2026-11-02 sync)"
+- **Upstream HEAD**: `kpokpxwr 30ee54ee` — "test(cron): the virtual-clock soak models run-now as an extra fire and admits 'missed' rows"
+- **Upstream release**: `rc.1-v0.22.6` + daily `v0.22.5+canary.*` tags; `pyproject.toml` version still `0.0.0` → `v2026.9.24` (`0.21.5`) remains the install-stamp base.
+- **Commits merged**: 4,293 (behind 4,293 → 0; ahead 32 → 33 with the merge)
+- **GHCR digest**: `sha256:3b00a6977b0d24a1b12828cb68be6a7da9ee2d7edf6334a6a13e26dca48e566b`
+  (locally built `hermes-agent-fork-test` `d9983e8d`, tagged + pushed)
+- **Running version**: `v0.21.5+19628 (2026.9.24) · upstream 0a1530bb`
+- **Pushed**: `git push origin main` → `9180920caa..0a1530bb28`
+
+### Conflicts
+
+**Zero**: Clean 3-way merge across 1,828 added files, 3,095 modified files, and 280
+removed files. `jj resolve --list` empty; the `<<<<<<<` grep hits in the tree are
+upstream source containing literal marker strings (`tools/file_operations_common.py`
+conflict-block detector, test fixtures, docs). Merge-vs-upstream diff is strictly
+the 9-file fork payload (+1,515/−6).
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py` ✓
+- lifecycle_guard `_DATA_EXTENSIONS` ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+- Upstream auth reset (`status_cleared_ids` in `agent/credential_pool_admin.py`) ✓
+- All three `_JJ_CANDIDATES`/`_JJ2` lists keep `/usr/local/bin/jj` first
+  (`kanban.py:523`, `:1418`, `:1575`) ✓
+- install-stamp regenerated on disk to `0.21.5+19628` (gitignored, not committed) ✓
+
+### Deployment impact (this pass)
+
+- Pin bumps: tailscale/node/ollama index digests, nmem 0.10.103 → 0.10.112,
+  mise 2026.10.25, agy 1.4.12, devin 3000.11.119, gh 2.103.3, nub 0.9.7,
+  deno 2.9.8. tmux 3.8 still deferred (mise registry lag).
+- New upstream capability: `tools/file_operations_common.py` surfaces unresolved
+  merge-conflict markers to the model on read.
+- Containers recreated and verified: `hermes`, `nowledge-mem`, `ollama`,
+  `tailscale` (browser untouched). All s6 longruns up; all Overmind procs serving
+  (HTTP 200 on 8081/8082/8083/1234/3000); tailnet CLI↔daemon byte-identical.
+
+---
 
 ## 2026-10-19 — sync to upstream `cc6b1f29`; clean 3-way merge across 5,587 commits
 
