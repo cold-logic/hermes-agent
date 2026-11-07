@@ -11,6 +11,51 @@ encountered, fork-specific changes verified, and deployment impact.
 
 ---
 ---
+## 2026-11-07 — sync to upstream `cf7003f3`; clean 3-way merge across 2,185 commits
+
+- **Merge commit**: `8f5d8c4a09c92ecbfe5834b4457a964993992216` — "Merge upstream/main into fork (2026-11-07 sync)"
+- **Upstream HEAD**: `ltnsspku cf7003f3` — "fix(desktop): persist Bot Chat wake diagnostics"
+- **Upstream release**: **`v0.23.0`** (+ `rc.2-v0.23.0`, daily `v0.23.0+canary.*` tags); `pyproject.toml` version still `0.0.0` → `v2026.9.24` (`0.21.5`) remains the install-stamp base.
+- **Commits merged**: 2,185 (behind 2,185 → 0; ahead 34 → 35 with the merge)
+- **GHCR digest**: `sha256:c2b3232cf6c5e8871ab0dfdf75826e1d9a6a74cbf8168ff73c902f1bf2a641e0`
+  (locally built `hermes-agent-fork-test` `6e0a5d02`, tagged + pushed)
+- **Running version**: `v0.21.5+21815 (2026.9.24) · upstream 8f5d8c4a`
+- **Pushed**: `git push origin main` → `d77313e844..8f5d8c4a09`
+
+### Conflicts
+
+**Zero**: clean 3-way merge across 858 added files, 2,006 modified files, and 92
+removed files. `jj resolve --list` empty. Merge-vs-upstream diff is strictly the
+9-file fork payload (`.github/workflows/docker-publish-fork.yml`, `CHANGELOG.md`,
+`cron/lifecycle_guard.py`, `hermes_cli/kanban{,_db,_db_workspace,_parser,_swarm}.py`,
+`hermes_cli/service_manager.py`; +1,559/−6).
+
+### Fork-specific changes verified surviving
+
+- jj workspace kind (`VALID_WORKSPACE_KINDS` includes `"jj"`, `kanban_db.py:116`) ✓
+- `HERMES_HOME_MODE=0710` in `service_manager.py` (:517) ✓
+- lifecycle_guard `_DATA_EXTENSIONS` (:307, 12 extensions) ✓
+- GHCR publishing workflow (`.github/workflows/docker-publish-fork.yml`) ✓
+- Upstream auth reset (`status_cleared_ids` in `agent/credential_pool_admin.py`) ✓
+- All `_JJ_CANDIDATES` lists keep `/usr/local/bin/jj` first
+  (`kanban_db_workspace.py:479,:1099`; `kanban.py:523,:1418,:1575,:1716`) ✓
+- install-stamp regenerated on disk to `0.21.5+21815` (gitignored, not committed) ✓
+- `fork-internals.md` symbol map unchanged — `resolve_workspace`,
+  `_cleanup_workspace`, `_jj_notify`, `_JJ_CANDIDATES` all still at their
+  documented locations ✓
+
+### Deployment impact (this pass)
+
+- Pin bumps: node + ollama index digests, nmem 0.10.112 → 0.10.115,
+  mise 2026.10.25 → 2026.11.3, agy 1.4.12 → 1.5.2, devin 3000.11.119 →
+  3000.11.239, jj 0.46.0 → 0.47.1, nub 0.9.7 → 0.10.0 (new single-binary layout —
+  Dockerfile copy block rewritten). tmux 3.8 still deferred (mise registry lag).
+- **Upstream renamed the gateway s6 service `gateway-default` → `profile-gateways`.**
+  Deployment docs/registry updated 2026-11-07.
+- Containers recreated: `hermes`, `nowledge-mem`, `ollama`.
+
+---
+
 
 ## 2026-11-02 — sync to upstream `30ee54ee`; clean 3-way merge across 4,293 commits
 
